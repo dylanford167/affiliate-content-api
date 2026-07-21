@@ -21,8 +21,26 @@ const oauthStates = new Map();
 const preparedMedia = new Map();
 const publicBaseUrl = process.env.PUBLIC_BASE_URL || `http://localhost:${port}`;
 const metaVersion = process.env.META_GRAPH_VERSION || "v23.0";
+const threadsScopes = [...new Set([
+  ...(process.env.THREADS_SCOPES || "").split(",").map(value => value.trim()).filter(Boolean),
+  "threads_basic",
+  "threads_content_publish",
+  "threads_manage_replies"
+])].join(",");
 app.use(cors({ origin: /^chrome-extension:\/\// }));
 app.use(express.json({ limit: "2mb" }));
+
+async function fetchManagedFacebookPages(userAccessToken) {
+  const params = new URLSearchParams({
+    fields: "id,name,access_token,instagram_business_account{id,username}",
+    limit: "100",
+    access_token: userAccessToken
+  });
+  const response = await fetch(`https://graph.facebook.com/${metaVersion}/me/accounts?${params}`);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error?.message || "Không tải được danh sách Facebook Page");
+  return Array.isArray(body.data) ? body.data : [];
+}
 
 app.get("/", (_req, res) => {
   res.type("html").send(`<!doctype html>
@@ -33,14 +51,28 @@ body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d1
 </head><body><main class="card"><span class="status"><i class="dot"></i>Server đang hoạt động</span><h1>Affiliate Content Studio</h1><p>Server API đã sẵn sàng tại cổng <code>${port}</code>.</p><ol><li>Giữ cửa sổ terminal đang chạy.</li><li>Mở một bài mạng xã hội được hỗ trợ.</li><li>Mở Chrome Extension và bấm <b>Quét bài viết hiện tại</b>.</li></ol><p>Kiểm tra kỹ thuật: <a href="/health">/health</a></p></main></body></html>`);
 });
 app.get("/health", (_req, res) => res.json({ ok: true }));
-app.get("/api/accounts", (_req, res) => res.json(Object.fromEntries([...accounts].map(([key, value]) => [key, {
-  connected: true,
-  profile: value.profile,
-  grantedPermissions: value.grantedPermissions || [],
-  canPublish: (value.grantedPermissions || []).includes("pages_manage_posts"),
-  canComment: (value.grantedPermissions || []).includes("pages_manage_engagement"),
-  items: (value.items || []).map(item => ({ id: item.id, name: item.name, username: item.username, pageId: item.pageId, pageName: item.pageName }))
-}]))));
+app.get("/api/accounts", async (_req, res) => {
+  const facebook = accounts.get("facebook");
+  if (facebook?.userAccessToken) {
+    try {
+      const pageData = await fetchManagedFacebookPages(facebook.userAccessToken);
+      facebook.items = pageData.map(page => ({ id: page.id, name: page.name, accessToken: page.access_token }));
+      facebook.pagesRefreshedAt = new Date().toISOString();
+      facebook.pagesRefreshError = null;
+    } catch (error) {
+      facebook.pagesRefreshError = error.message;
+    }
+  }
+  res.json(Object.fromEntries([...accounts].map(([key, value]) => [key, {
+    connected: true,
+    profile: value.profile,
+    grantedPermissions: value.grantedPermissions || [],
+    canPublish: (value.grantedPermissions || []).includes("pages_manage_posts"),
+    canComment: (value.grantedPermissions || []).includes("pages_manage_engagement"),
+    items: (value.items || []).map(item => ({ id: item.id, name: item.name, username: item.username, pageId: item.pageId, pageName: item.pageName })),
+    refreshError: value.pagesRefreshError || undefined
+  }])));
+});
 
 const allowedMediaHosts = ["facebook.com", "fbcdn.net", "cdninstagram.com", "instagram.com", "threads.net", "threads.com", "tiktok.com", "tiktokcdn.com", "tiktokcdn-us.com", "byteoversea.com", "ibytedtos.com", "muscdn.com", "akamaized.net"];
 function assertAllowedMediaUrl(value) {
@@ -215,7 +247,7 @@ app.get("/auth/:platform", (req, res) => {
     if (!clientId || !process.env.THREADS_APP_SECRET) return res.status(501).send("Thiếu THREADS_APP_ID hoặc THREADS_APP_SECRET trong server/.env");
     const state = crypto.randomUUID();
     oauthStates.set(state, { platform, createdAt: Date.now() });
-    const params = new URLSearchParams({ client_id: clientId, redirect_uri: `${publicBaseUrl}/auth/threads/callback`, scope: process.env.THREADS_SCOPES || "threads_basic,threads_content_publish,threads_manage_replies", response_type: "code", state });
+    const params = new URLSearchParams({ client_id: clientId, redirect_uri: `${publicBaseUrl}/auth/threads/callback`, scope: threadsScopes, response_type: "code", state });
     return res.redirect(`https://threads.net/oauth/authorize?${params}`);
   }
   if (platform === "tiktok") {
@@ -238,7 +270,7 @@ app.get("/auth/threads/callback", async (req, res) => {
     const token = await tokenResponse.json(); if (!tokenResponse.ok || !token.access_token) throw new Error(token.error_message || token.error?.message || "Không lấy được token");
     const profileResponse = await fetch(`https://graph.threads.net/v1.0/me?fields=id,username,threads_profile_picture_url&access_token=${encodeURIComponent(token.access_token)}`);
     const profile = await profileResponse.json(); if (!profileResponse.ok) throw new Error(profile.error?.message || "Không đọc được Threads profile");
-    accounts.set("threads", { connectedAt: new Date().toISOString(), profile, items: [{ id: profile.id, name: profile.username }], grantedPermissions: (process.env.THREADS_SCOPES || "").split(","), userAccessToken: token.access_token });
+    accounts.set("threads", { connectedAt: new Date().toISOString(), profile, items: [{ id: profile.id, name: profile.username }], grantedPermissions: threadsScopes.split(","), userAccessToken: token.access_token });
     res.type("html").send(`<meta charset="utf-8"><h1>Đã kết nối Threads</h1><p>@${profile.username}</p><p>Đóng tab này và bấm Làm mới trong extension.</p>`);
   } catch (error) { res.status(500).send(`Threads OAuth thất bại: ${error.message}`); }
 });
@@ -283,9 +315,10 @@ app.get("/auth/meta/callback", async (req, res) => {
     const grantedPermissions = permissionsResponse.ok
       ? (permissionsBody.data || []).filter(permission => permission.status === "granted").map(permission => permission.permission)
       : [];
-    const pagesResponse = await fetch(`https://graph.facebook.com/${metaVersion}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&access_token=${encodeURIComponent(token.access_token)}`);
-    const pages = await pagesResponse.json();
-    const pageData = pagesResponse.ok && Array.isArray(pages.data) ? pages.data : [];
+    let pageData = [];
+    let pagesError = "";
+    try { pageData = await fetchManagedFacebookPages(token.access_token); }
+    catch (error) { pagesError = error.message; }
     const connected = session.platform === "instagram"
       ? pageData.filter(page => page.instagram_business_account).map(page => ({ pageId: page.id, pageName: page.name, ...page.instagram_business_account, accessToken: page.access_token }))
       : pageData.map(page => ({ id: page.id, name: page.name, accessToken: page.access_token }));
@@ -298,7 +331,7 @@ app.get("/auth/meta/callback", async (req, res) => {
       grantedPermissions: mergedPermissions,
       userAccessToken: token.access_token
     });
-    const permissionNote = pagesResponse.ok ? "" : `<p style="color:#ffcb6b">Đăng nhập cơ bản thành công, nhưng app chưa có quyền đọc Page. Hãy thêm quyền Page trong Meta Use Case rồi cập nhật META_${session.platform.toUpperCase()}_SCOPES.</p>`;
+    const permissionNote = !pagesError ? "" : `<p style="color:#ffcb6b">Đăng nhập cơ bản thành công, nhưng app chưa đọc lại được Page: ${pagesError}. Hãy kiểm tra quyền Page trong Meta Use Case rồi kết nối lại.</p>`;
     res.type("html").send(`<meta charset="utf-8"><title>Đã kết nối</title><style>body{background:#0b0d10;color:#fff;font:16px system-ui;padding:40px}a{color:#cbff4a}</style><h1>Đã kết nối ${session.platform}</h1><p>Tài khoản: ${profile.name}</p><p>Tìm thấy ${connected.length} tài khoản/Page có thể quản lý.</p>${permissionNote}<p>Bạn có thể đóng tab này và bấm Làm mới trong extension.</p>`);
   } catch (error) {
     res.status(500).send(`OAuth thất bại: ${error.message}`);
@@ -326,7 +359,10 @@ app.post("/api/publish", async (req, res) => {
           const apiError = body.error || {};
           const code = [apiError.code, apiError.error_subcode].filter(value => value !== undefined).join("/");
           const detail = apiError.error_user_msg || apiError.error_data?.details || body.error_message || "";
-          throw new Error(`${stage}: ${apiError.message || "Threads API từ chối yêu cầu"}${code ? ` (#${code})` : ""}${detail ? ` — ${detail}` : ""}`);
+          const error = new Error(`${stage}: ${apiError.message || "Threads API từ chối yêu cầu"}${code ? ` (#${code})` : ""}${detail ? ` — ${detail}` : ""}`);
+          error.httpStatus = response.status;
+          error.apiCode = apiError.code;
+          throw error;
         }
         return body;
       };
@@ -334,29 +370,82 @@ app.post("/api/publish", async (req, res) => {
         const params = new URLSearchParams(Object.entries({ ...payload, access_token: threads.userAccessToken }).map(([key, value]) => [key, String(value)]));
         const response = await fetch(`https://graph.threads.net/v1.0/${path}?${params}`);
         const body = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(body.error?.message || body.error_message || "Không kiểm tra được trạng thái media Threads");
+        if (!response.ok) {
+          const error = new Error(body.error?.message || body.error_message || "Không kiểm tra được trạng thái media Threads");
+          error.httpStatus = response.status;
+          error.apiCode = body.error?.code;
+          throw error;
+        }
         return body;
       };
-      const waitContainer = async id => {
-        for (let attempt = 0; attempt < 12; attempt++) {
-          const state = await threadsGet(id, { fields: "status,error_message" });
-          if (["FINISHED", "PUBLISHED"].includes(state.status)) return;
-          if (["ERROR", "EXPIRED"].includes(state.status)) throw new Error(state.error_message || `Threads xử lý media thất bại (${state.status})`);
-          await new Promise(resolve => setTimeout(resolve, 1250));
+      const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+      const isTransientThreadsError = error =>
+        error?.httpStatus === 429 || error?.httpStatus >= 500 || [1, 2, 4, 17, 32, 341].includes(Number(error?.apiCode));
+      const waitContainer = async (id, { timeoutMs = 120000, label = "media" } = {}) => {
+        const startedAt = Date.now();
+        let attempt = 0;
+        let lastStatus = "IN_PROGRESS";
+        let lastLookupError = null;
+        while (Date.now() - startedAt < timeoutMs) {
+          try {
+            const state = await threadsGet(id, { fields: "id,status,error_message" });
+            lastStatus = String(state.status || "IN_PROGRESS").toUpperCase();
+            lastLookupError = null;
+            if (["FINISHED", "PUBLISHED"].includes(lastStatus)) return state;
+            if (["ERROR", "EXPIRED"].includes(lastStatus)) {
+              throw new Error(state.error_message || `Threads xử lý ${label} thất bại (${lastStatus})`);
+            }
+          } catch (error) {
+            if (!isTransientThreadsError(error)) throw error;
+            lastLookupError = error;
+          }
+          const delayMs = Math.min(5000, 1200 + attempt * 350);
+          await sleep(delayMs);
+          attempt += 1;
         }
-        throw new Error("Threads xử lý media quá lâu; hãy thử đăng lại sau.");
+        const detail = lastLookupError ? ` Lần kiểm tra cuối lỗi: ${lastLookupError.message}` : "";
+        throw new Error(`Threads vẫn đang xử lý ${label} sau ${Math.round(timeoutMs / 1000)} giây (trạng thái ${lastStatus}).${detail} Hãy giữ nguyên bản nháp và bấm đăng lại sau.`);
+      };
+      const publishContainer = async (creationId, label = "bài viết") => {
+        await waitContainer(creationId, { timeoutMs: 120000, label });
+        let lastError;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            return await threadsPost("me/threads_publish", { creation_id: creationId }, `Xuất bản ${label}`);
+          } catch (error) {
+            lastError = error;
+            const stillProcessing = /not ready|in.progress|processing|media.*ready|try again/i.test(error.message);
+            if ((!stillProcessing && !isTransientThreadsError(error)) || attempt === 2) throw error;
+            await sleep(2500 * (attempt + 1));
+            await waitContainer(creationId, { timeoutMs: 30000, label });
+          }
+        }
+        throw lastError;
+      };
+      const createCarouselChildren = async () => {
+        const children = new Array(selectedUrls.length);
+        const concurrency = 4;
+        for (let offset = 0; offset < selectedUrls.length; offset += concurrency) {
+          const batch = selectedUrls.slice(offset, offset + concurrency);
+          const created = await Promise.all(batch.map(async (url, batchIndex) => {
+            const index = offset + batchIndex;
+            const isVideo = selectedVideos.includes(url);
+            const publicUrl = mediaProxyUrl(url);
+            const child = await threadsPost("me/threads", {
+              media_type: isVideo ? "VIDEO" : "IMAGE",
+              ...(isVideo ? { video_url: publicUrl } : { image_url: publicUrl }),
+              is_carousel_item: true
+            }, `Tạo ${isVideo ? "video" : "ảnh"} ${index + 1}`);
+            if (!child.id) throw new Error(`Threads không tạo được media thứ ${index + 1} trong carousel`);
+            return child.id;
+          }));
+          created.forEach((id, batchIndex) => { children[offset + batchIndex] = id; });
+        }
+        return children;
       };
       let creation;
       if (selectedUrls.length > 1) {
-        const children = [];
-        for (const [index, url] of selectedUrls.entries()) {
-          const isVideo = selectedVideos.includes(url);
-          const publicUrl = mediaProxyUrl(url);
-          const child = await threadsPost("me/threads", { media_type: isVideo ? "VIDEO" : "IMAGE", ...(isVideo ? { video_url: publicUrl } : { image_url: publicUrl }), is_carousel_item: true }, `Tạo ${isVideo ? "video" : "ảnh"} ${index + 1}`);
-          if (!child.id) throw new Error("Threads không tạo được carousel item");
-          if (isVideo) await waitContainer(child.id);
-          children.push(child.id);
-        }
+        const children = await createCarouselChildren();
         creation = await threadsPost("me/threads", { media_type: "CAROUSEL", children: children.join(","), text: draft.caption }, "Tạo carousel");
       } else {
         const mediaType = selectedVideos.length ? "VIDEO" : selectedUrls.length ? "IMAGE" : "TEXT";
@@ -364,19 +453,25 @@ app.post("/api/publish", async (req, res) => {
         creation = await threadsPost("me/threads", { media_type: mediaType, text: draft.caption, ...(mediaType === "IMAGE" ? { image_url: publicUrl } : {}), ...(mediaType === "VIDEO" ? { video_url: publicUrl } : {}) }, `Tạo bài ${mediaType.toLowerCase()}`);
       }
       if (!creation.id) throw new Error("Threads không tạo được media container");
-      if (selectedUrls.length) await waitContainer(creation.id);
-      const publishForm = new URLSearchParams({ creation_id: creation.id, access_token: threads.userAccessToken });
-      const publishResponse = await fetch("https://graph.threads.net/v1.0/me/threads_publish", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: publishForm });
-      const published = await publishResponse.json();
-      if (!publishResponse.ok) throw new Error(published.error?.message || "Threads từ chối xuất bản");
+      const published = await publishContainer(creation.id, selectedUrls.length > 1 ? "carousel" : "bài viết");
+      if (!published.id) throw new Error("Threads đã nhận container nhưng không trả ID bài viết");
       const commentMessage = [draft.commentText, draft.affiliateLink].map(value => String(value || "").trim()).filter(Boolean).join("\n\n");
       let comment = null;
       if (commentMessage && published.id) {
-        try {
-          const replyCreation = await threadsPost("me/threads", { media_type: "TEXT", text: commentMessage, reply_to_id: published.id }, "Tạo comment Threads");
-          const reply = await threadsPost("me/threads_publish", { creation_id: replyCreation.id }, "Đăng comment Threads");
-          comment = { ok: Boolean(reply.id), id: reply.id, pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } };
-        } catch (error) { comment = { ok: false, error: error.message, pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } }; }
+        let replyError;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const reply = await threadsPost("me/threads", { media_type: "TEXT", text: commentMessage, reply_to_id: published.id, auto_publish_text: true }, "Đăng comment Threads");
+            if (!reply.id) throw new Error("Threads không trả ID comment");
+            comment = { ok: true, id: reply.id, pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } };
+            break;
+          } catch (error) {
+            replyError = error;
+            if (!isTransientThreadsError(error) || attempt === 2) break;
+            await sleep(1500 * (attempt + 1));
+          }
+        }
+        if (!comment) comment = { ok: false, error: replyError?.message || "Threads không đăng được comment", pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } };
       }
       return res.json({ requestId: crypto.randomUUID(), results: [{ platform: "threads", ok: true, postId: published.id, comment }] });
     } catch (error) { return res.status(502).json({ error: error.message }); }

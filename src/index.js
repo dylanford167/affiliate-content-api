@@ -8,6 +8,7 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { openAsBlob } from "node:fs";
 import { spawn } from "node:child_process";
+import { Readable } from "node:stream";
 import ffmpegPath from "ffmpeg-static";
 
 const serverDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -47,6 +48,54 @@ function assertAllowedMediaUrl(value) {
   if (url.protocol !== "https:" || !allowedMediaHosts.some(host => url.hostname === host || url.hostname.endsWith(`.${host}`))) throw new Error("URL video không thuộc CDN mạng xã hội được hỗ trợ");
   return url.href;
 }
+
+const mediaProxySecret = process.env.MEDIA_PROXY_SECRET || process.env.THREADS_APP_SECRET || process.env.META_APP_SECRET || "development-only";
+function signMediaValue(value) {
+  return crypto.createHmac("sha256", mediaProxySecret).update(value).digest("base64url");
+}
+function mediaProxyUrl(sourceUrl) {
+  const source = assertAllowedMediaUrl(sourceUrl);
+  if (!/^https:\/\//i.test(publicBaseUrl)) throw new Error("PUBLIC_BASE_URL phải là HTTPS công khai để Threads tải media");
+  const encoded = Buffer.from(source).toString("base64url");
+  return `${publicBaseUrl}/api/media/proxy?u=${encodeURIComponent(encoded)}&s=${encodeURIComponent(signMediaValue(encoded))}`;
+}
+
+app.get("/api/media/proxy", async (req, res) => {
+  try {
+    const encoded = String(req.query.u || "");
+    const signature = String(req.query.s || "");
+    const expected = signMediaValue(encoded);
+    if (!signature || signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return res.status(403).end();
+    const source = assertAllowedMediaUrl(Buffer.from(encoded, "base64url").toString("utf8"));
+    const hostname = new URL(source).hostname;
+    const referer = hostname.endsWith("fbcdn.net") || hostname.endsWith("facebook.com") ? "https://www.facebook.com/"
+      : hostname.endsWith("cdninstagram.com") || hostname.endsWith("instagram.com") ? "https://www.instagram.com/"
+      : hostname.endsWith("threads.net") || hostname.endsWith("threads.com") ? "https://www.threads.net/"
+      : "https://www.tiktok.com/";
+    const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36", Referer: referer };
+    if (req.headers.range) headers.Range = req.headers.range;
+    let currentSource = source;
+    let upstream;
+    for (let redirect = 0; redirect < 4; redirect++) {
+      upstream = await fetch(currentSource, { headers, redirect: "manual", signal: AbortSignal.timeout(120000) });
+      if (![301, 302, 303, 307, 308].includes(upstream.status)) break;
+      const location = upstream.headers.get("location");
+      if (!location) break;
+      currentSource = assertAllowedMediaUrl(new URL(location, currentSource).href);
+    }
+    if (!upstream) return res.status(502).end();
+    if (!upstream.ok && upstream.status !== 206) return res.status(upstream.status).end();
+    ["content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"].forEach(name => {
+      const value = upstream.headers.get(name); if (value) res.setHeader(name, value);
+    });
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.status(upstream.status);
+    if (!upstream.body) return res.end();
+    Readable.fromWeb(upstream.body).pipe(res);
+  } catch (error) {
+    if (!res.headersSent) res.status(502).json({ error: error.message }); else res.end();
+  }
+});
 
 function looksLikeVideoUrl(value) {
   return /\.(?:mp4|m3u8|mpd)(?:\?|$)/i.test(String(value || ""));
@@ -267,30 +316,55 @@ app.post("/api/publish", async (req, res) => {
   if (publishPlatform === "threads") {
     const threads = accounts.get("threads");
     if (!threads) return res.status(401).json({ error: "Threads chưa kết nối" });
-    if (selectedUrls.length > 10) return res.status(400).json({ error: "Threads hỗ trợ tối đa 10 media mỗi carousel" });
+    if (selectedUrls.length > 20) return res.status(400).json({ error: "Threads hỗ trợ tối đa 20 media mỗi carousel" });
     try {
-      const threadsPost = async (path, payload) => {
+      const threadsPost = async (path, payload, stage = path) => {
         const form = new URLSearchParams(Object.entries({ ...payload, access_token: threads.userAccessToken }).map(([key, value]) => [key, String(value)]));
         const response = await fetch(`https://graph.threads.net/v1.0/${path}`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: form });
         const body = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(body.error?.message || body.error_message || "Threads API từ chối yêu cầu");
+        if (!response.ok) {
+          const apiError = body.error || {};
+          const code = [apiError.code, apiError.error_subcode].filter(value => value !== undefined).join("/");
+          const detail = apiError.error_user_msg || apiError.error_data?.details || body.error_message || "";
+          throw new Error(`${stage}: ${apiError.message || "Threads API từ chối yêu cầu"}${code ? ` (#${code})` : ""}${detail ? ` — ${detail}` : ""}`);
+        }
         return body;
+      };
+      const threadsGet = async (path, payload = {}) => {
+        const params = new URLSearchParams(Object.entries({ ...payload, access_token: threads.userAccessToken }).map(([key, value]) => [key, String(value)]));
+        const response = await fetch(`https://graph.threads.net/v1.0/${path}?${params}`);
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error?.message || body.error_message || "Không kiểm tra được trạng thái media Threads");
+        return body;
+      };
+      const waitContainer = async id => {
+        for (let attempt = 0; attempt < 12; attempt++) {
+          const state = await threadsGet(id, { fields: "status,error_message" });
+          if (["FINISHED", "PUBLISHED"].includes(state.status)) return;
+          if (["ERROR", "EXPIRED"].includes(state.status)) throw new Error(state.error_message || `Threads xử lý media thất bại (${state.status})`);
+          await new Promise(resolve => setTimeout(resolve, 1250));
+        }
+        throw new Error("Threads xử lý media quá lâu; hãy thử đăng lại sau.");
       };
       let creation;
       if (selectedUrls.length > 1) {
         const children = [];
-        for (const url of selectedUrls) {
+        for (const [index, url] of selectedUrls.entries()) {
           const isVideo = selectedVideos.includes(url);
-          const child = await threadsPost("me/threads", { media_type: isVideo ? "VIDEO" : "IMAGE", ...(isVideo ? { video_url: url } : { image_url: url }), is_carousel_item: true });
+          const publicUrl = mediaProxyUrl(url);
+          const child = await threadsPost("me/threads", { media_type: isVideo ? "VIDEO" : "IMAGE", ...(isVideo ? { video_url: publicUrl } : { image_url: publicUrl }), is_carousel_item: true }, `Tạo ${isVideo ? "video" : "ảnh"} ${index + 1}`);
           if (!child.id) throw new Error("Threads không tạo được carousel item");
+          if (isVideo) await waitContainer(child.id);
           children.push(child.id);
         }
-        creation = await threadsPost("me/threads", { media_type: "CAROUSEL", children: children.join(","), text: draft.caption });
+        creation = await threadsPost("me/threads", { media_type: "CAROUSEL", children: children.join(","), text: draft.caption }, "Tạo carousel");
       } else {
         const mediaType = selectedVideos.length ? "VIDEO" : selectedUrls.length ? "IMAGE" : "TEXT";
-        creation = await threadsPost("me/threads", { media_type: mediaType, text: draft.caption, ...(mediaType === "IMAGE" ? { image_url: selectedUrls[0] } : {}), ...(mediaType === "VIDEO" ? { video_url: selectedUrls[0] } : {}) });
+        const publicUrl = selectedUrls[0] ? mediaProxyUrl(selectedUrls[0]) : "";
+        creation = await threadsPost("me/threads", { media_type: mediaType, text: draft.caption, ...(mediaType === "IMAGE" ? { image_url: publicUrl } : {}), ...(mediaType === "VIDEO" ? { video_url: publicUrl } : {}) }, `Tạo bài ${mediaType.toLowerCase()}`);
       }
       if (!creation.id) throw new Error("Threads không tạo được media container");
+      if (selectedUrls.length) await waitContainer(creation.id);
       const publishForm = new URLSearchParams({ creation_id: creation.id, access_token: threads.userAccessToken });
       const publishResponse = await fetch("https://graph.threads.net/v1.0/me/threads_publish", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: publishForm });
       const published = await publishResponse.json();
@@ -299,7 +373,8 @@ app.post("/api/publish", async (req, res) => {
       let comment = null;
       if (commentMessage && published.id) {
         try {
-          const reply = await threadsPost(`${published.id}/replies`, { text: commentMessage });
+          const replyCreation = await threadsPost("me/threads", { media_type: "TEXT", text: commentMessage, reply_to_id: published.id }, "Tạo comment Threads");
+          const reply = await threadsPost("me/threads_publish", { creation_id: replyCreation.id }, "Đăng comment Threads");
           comment = { ok: Boolean(reply.id), id: reply.id, pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } };
         } catch (error) { comment = { ok: false, error: error.message, pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } }; }
       }

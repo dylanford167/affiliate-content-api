@@ -28,7 +28,7 @@ const threadsScopes = [...new Set([
   "threads_manage_replies"
 ])].join(",");
 app.use(cors({ origin: /^chrome-extension:\/\// }));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "4mb" }));
 
 async function fetchManagedFacebookPages(userAccessToken) {
   const params = new URLSearchParams({
@@ -528,11 +528,67 @@ app.post("/api/publish", async (req, res) => {
       return body;
     };
 
+    const uploadFacebookPhoto = async (value, published, caption = "") => {
+      const source = String(value || "");
+      const dataMatch = source.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
+      if (!dataMatch) return graphPost("photos", { url: source, published, ...(caption ? { caption } : {}) });
+      const buffer = Buffer.from(dataMatch[2], "base64");
+      if (!buffer.length || buffer.length > 3 * 1024 * 1024) throw new Error("Ảnh thêm từ máy vượt giới hạn 3 MB.");
+      const extension = dataMatch[1].split("/")[1].replace("jpg", "jpeg");
+      const form = new FormData();
+      form.set("source", new Blob([buffer], { type: dataMatch[1] }), `affiliate-image.${extension}`);
+      form.set("published", String(Boolean(published)));
+      if (caption) form.set("caption", caption);
+      form.set("access_token", page.accessToken);
+      const response = await fetch(`https://graph.facebook.com/${metaVersion}/${page.id}/photos`, { method: "POST", body: form, signal: AbortSignal.timeout(120000) });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || !body.id) throw new Error(body.error?.message || "Meta từ chối ảnh thêm từ máy.");
+      return body;
+    };
+
+    // Page video uploads are asynchronous.  Do not attach an unpublished video
+    // to a feed post until Facebook has finished transcoding it.
+    const waitForFacebookVideo = async videoId => {
+      const startedAt = Date.now();
+      let lastStatus = "processing";
+      let readFailures = 0;
+      while (Date.now() - startedAt < 90000) {
+        const params = new URLSearchParams({ fields: "status", access_token: page.accessToken });
+        let response;
+        let body = {};
+        try {
+          response = await fetch(`https://graph.facebook.com/${metaVersion}/${videoId}?${params}`, { signal: AbortSignal.timeout(15000) });
+          body = await response.json().catch(() => ({}));
+        } catch (error) {
+          readFailures += 1;
+          if (readFailures >= 3) return { status: "unknown", detail: error.message };
+          await new Promise(resolve => setTimeout(resolve, 2500));
+          continue;
+        }
+        if (!response.ok) {
+          readFailures += 1;
+          if (readFailures >= 3) return { status: "unknown", detail: body.error?.message };
+        } else {
+          readFailures = 0;
+          const status = body.status || {};
+          const videoStatus = String(status.video_status || "").toLowerCase();
+          const processingStatus = String(status.processing_phase?.status || "").toLowerCase();
+          lastStatus = videoStatus || processingStatus || lastStatus;
+          if (["ready", "complete", "completed", "published"].includes(videoStatus) || ["complete", "completed"].includes(processingStatus)) return { status: "ready", detail: status };
+          if (["error", "failed"].includes(videoStatus) || ["error", "failed"].includes(processingStatus)) {
+            throw new Error(status.processing_phase?.errors?.[0]?.message || "Facebook không xử lý được video trong bài hỗn hợp.");
+          }
+        }
+        await new Promise(resolve => setTimeout(resolve, 2500));
+      }
+      return { status: "timeout", detail: lastStatus };
+    };
+
     let result;
     if (videoUrls.length === 1 && imageUrls.length > 0) {
       const attachedMedia = [];
       for (const url of imageUrls) {
-        const photo = await graphPost("photos", { url, published: false });
+        const photo = await uploadFacebookPhoto(url, false);
         if (!photo.id) throw new Error("Meta không trả ID cho một ảnh trong bài hỗn hợp.");
         attachedMedia.push({ media_fbid: photo.id });
       }
@@ -550,6 +606,8 @@ app.post("/api/publish", async (req, res) => {
         });
         const video = await upload.json().catch(() => ({}));
         if (!upload.ok || !video.id) throw new Error(video.error?.message || "Meta không trả ID cho video trong bài hỗn hợp.");
+        const videoState = await waitForFacebookVideo(video.id);
+        if (videoState.status === "timeout") throw new Error(`Facebook vẫn đang xử lý video (${videoState.detail}). Hãy thử đăng lại sau ít phút.`);
         attachedMedia.push({ media_fbid: video.id });
       } finally {
         await fs.rm(prepared.outputPath, { force: true }).catch(() => {});
@@ -577,11 +635,11 @@ app.post("/api/publish", async (req, res) => {
         await fs.rm(prepared.outputPath, { force: true }).catch(() => {});
       }
     } else if (imageUrls.length === 1) {
-      result = await graphPost("photos", { url: imageUrls[0], caption: draft.caption });
+      result = await uploadFacebookPhoto(imageUrls[0], true, draft.caption);
     } else if (imageUrls.length > 1) {
       const attachedMedia = [];
       for (const url of imageUrls) {
-        const photo = await graphPost("photos", { url, published: false });
+        const photo = await uploadFacebookPhoto(url, false);
         if (!photo.id) throw new Error("Meta không trả ID cho một ảnh trong album.");
         attachedMedia.push({ media_fbid: photo.id });
       }

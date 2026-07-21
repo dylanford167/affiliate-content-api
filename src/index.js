@@ -10,6 +10,7 @@ import { openAsBlob } from "node:fs";
 import { spawn } from "node:child_process";
 import { Readable } from "node:stream";
 import ffmpegPath from "ffmpeg-static";
+import { put as putBlob, del as deleteBlob } from "@vercel/blob";
 
 const serverDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 dotenv.config({ path: path.join(serverDirectory, ".env") });
@@ -102,8 +103,8 @@ app.get("/api/media/proxy", async (req, res) => {
     const hostname = new URL(source).hostname;
     const referer = hostname.endsWith("fbcdn.net") || hostname.endsWith("facebook.com") ? "https://www.facebook.com/"
       : hostname.endsWith("cdninstagram.com") || hostname.endsWith("instagram.com") ? "https://www.instagram.com/"
-      : hostname.endsWith("threads.net") || hostname.endsWith("threads.com") ? "https://www.threads.net/"
-      : "https://www.tiktok.com/";
+        : hostname.endsWith("threads.net") || hostname.endsWith("threads.com") ? "https://www.threads.net/"
+          : "https://www.tiktok.com/";
     const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36", Referer: referer };
     if (req.headers.range) headers.Range = req.headers.range;
     let currentSource = source;
@@ -157,8 +158,8 @@ async function prepareVideoMp4(sourceUrl) {
   const hostname = new URL(source).hostname;
   const referer = hostname.endsWith("fbcdn.net") || hostname.endsWith("facebook.com") ? "https://www.facebook.com/"
     : hostname.endsWith("cdninstagram.com") || hostname.endsWith("instagram.com") ? "https://www.instagram.com/"
-    : hostname.endsWith("threads.net") || hostname.endsWith("threads.com") ? "https://www.threads.net/"
-    : "https://www.tiktok.com/";
+      : hostname.endsWith("threads.net") || hostname.endsWith("threads.com") ? "https://www.threads.net/"
+        : "https://www.tiktok.com/";
   const common = ["-y", "-loglevel", "error", "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36", "-referer", referer, "-i", source, "-map", "0:v:0", "-map", "0:a?", "-movflags", "+faststart"];
   try {
     try {
@@ -171,7 +172,7 @@ async function prepareVideoMp4(sourceUrl) {
     if (stat.size > 1024 * 1024 * 1024) throw new Error("Video lon hon 1 GB; hay chon video ngan hon de dang");
     return { outputPath, size: stat.size };
   } catch (error) {
-    await fs.rm(outputPath, { force: true }).catch(() => {});
+    await fs.rm(outputPath, { force: true }).catch(() => { });
     throw error;
   }
 }
@@ -185,8 +186,8 @@ app.post("/api/media/prepare", async (req, res) => {
     const hostname = new URL(sourceUrl).hostname;
     const referer = hostname.endsWith("fbcdn.net") || hostname.endsWith("facebook.com") ? "https://www.facebook.com/"
       : hostname.endsWith("cdninstagram.com") || hostname.endsWith("instagram.com") ? "https://www.instagram.com/"
-      : hostname.endsWith("threads.net") || hostname.endsWith("threads.com") ? "https://www.threads.net/"
-      : "https://www.tiktok.com/";
+        : hostname.endsWith("threads.net") || hostname.endsWith("threads.com") ? "https://www.threads.net/"
+          : "https://www.tiktok.com/";
     const common = ["-y", "-loglevel", "error", "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36", "-referer", referer, "-i", sourceUrl, "-map", "0:v:0", "-map", "0:a?", "-movflags", "+faststart"];
     try {
       await runFfmpeg([...common, "-c", "copy", outputPath]);
@@ -198,7 +199,7 @@ app.post("/api/media/prepare", async (req, res) => {
     preparedMedia.set(id, { path: outputPath, createdAt: Date.now() });
     res.json({ ok: true, size: stat.size, downloadUrl: `/api/media/download/${id}` });
   } catch (error) {
-    if (outputPath) await fs.rm(outputPath, { force: true }).catch(() => {});
+    if (outputPath) await fs.rm(outputPath, { force: true }).catch(() => { });
     res.status(422).json({ error: error.message });
   }
 });
@@ -208,7 +209,7 @@ app.get("/api/media/download/:id", (req, res) => {
   if (!media) return res.status(404).json({ error: "Video đã hết hạn hoặc không tồn tại" });
   res.download(media.path, "video.mp4", error => {
     if (!error) preparedMedia.delete(req.params.id);
-    if (!error) fs.rm(media.path, { force: true }).catch(() => {});
+    if (!error) fs.rm(media.path, { force: true }).catch(() => { });
   });
 });
 
@@ -422,6 +423,18 @@ app.post("/api/publish", async (req, res) => {
         }
         throw lastError;
       };
+      const hostThreadsCommentImage = async value => {
+        const source = String(value || "").trim();
+        if (/^https:\/\//i.test(source)) return { url: source, cleanup: null };
+        const match = source.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
+        if (!match) throw new Error("Ảnh comment Threads không đúng định dạng.");
+        if (!process.env.BLOB_READ_WRITE_TOKEN) throw new Error("Thiếu BLOB_READ_WRITE_TOKEN để gửi ảnh comment Threads. Hãy tạo Vercel Blob Store public và thêm biến môi trường.");
+        const buffer = Buffer.from(match[2], "base64");
+        if (!buffer.length || buffer.length > 3 * 1024 * 1024) throw new Error("Ảnh comment Threads vượt giới hạn 3 MB.");
+        const extension = match[1].split("/")[1].replace("jpg", "jpeg");
+        const blob = await putBlob(`threads-comments/${crypto.randomUUID()}.${extension}`, buffer, { access: "public", contentType: match[1], addRandomSuffix: false });
+        return { url: blob.url, cleanup: () => deleteBlob(blob.url) };
+      };
       const createCarouselChildren = async () => {
         const children = new Array(selectedUrls.length);
         const concurrency = 4;
@@ -456,12 +469,19 @@ app.post("/api/publish", async (req, res) => {
       const published = await publishContainer(creation.id, selectedUrls.length > 1 ? "carousel" : "bài viết");
       if (!published.id) throw new Error("Threads đã nhận container nhưng không trả ID bài viết");
       const commentMessage = [draft.commentText, draft.affiliateLink].map(value => String(value || "").trim()).filter(Boolean).join("\n\n");
+      const commentImage = String(draft.commentImage || "").trim();
       let comment = null;
-      if (commentMessage && published.id) {
+      if ((commentMessage || commentImage) && published.id) {
         let replyError;
+        let hostedImage;
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
-            const reply = await threadsPost("me/threads", { media_type: "TEXT", text: commentMessage, reply_to_id: published.id, auto_publish_text: true }, "Đăng comment Threads");
+            if (commentImage && !hostedImage) hostedImage = await hostThreadsCommentImage(commentImage);
+            const replyContainer = await threadsPost("me/threads", commentImage
+              ? { media_type: "IMAGE", ...(commentMessage ? { text: commentMessage } : {}), image_url: hostedImage.url, reply_to_id: published.id }
+              : { media_type: "TEXT", text: commentMessage, reply_to_id: published.id, auto_publish_text: true }, "Đăng comment Threads");
+            if (!replyContainer.id) throw new Error("Threads không trả ID comment container");
+            const reply = commentImage ? await publishContainer(replyContainer.id, "comment Threads") : replyContainer;
             if (!reply.id) throw new Error("Threads không trả ID comment");
             comment = { ok: true, id: reply.id, pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } };
             break;
@@ -471,6 +491,7 @@ app.post("/api/publish", async (req, res) => {
             await sleep(1500 * (attempt + 1));
           }
         }
+        if (hostedImage?.cleanup) await hostedImage.cleanup().catch(() => { });
         if (!comment) comment = { ok: false, error: replyError?.message || "Threads không đăng được comment", pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } };
       }
       return res.json({ requestId: crypto.randomUUID(), results: [{ platform: "threads", ok: true, postId: published.id, comment }] });
@@ -528,15 +549,21 @@ app.post("/api/publish", async (req, res) => {
       return body;
     };
 
+    const decodeImageDataUrl = value => {
+      const source = String(value || "");
+      const match = source.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
+      if (!match) return null;
+      const buffer = Buffer.from(match[2], "base64");
+      if (!buffer.length || buffer.length > 3 * 1024 * 1024) throw new Error("Ảnh thêm từ máy vượt giới hạn 3 MB.");
+      return { buffer, mimeType: match[1], extension: match[1].split("/")[1].replace("jpg", "jpeg") };
+    };
+
     const uploadFacebookPhoto = async (value, published, caption = "") => {
       const source = String(value || "");
-      const dataMatch = source.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
-      if (!dataMatch) return graphPost("photos", { url: source, published, ...(caption ? { caption } : {}) });
-      const buffer = Buffer.from(dataMatch[2], "base64");
-      if (!buffer.length || buffer.length > 3 * 1024 * 1024) throw new Error("Ảnh thêm từ máy vượt giới hạn 3 MB.");
-      const extension = dataMatch[1].split("/")[1].replace("jpg", "jpeg");
+      const imageData = decodeImageDataUrl(source);
+      if (!imageData) return graphPost("photos", { url: source, published, ...(caption ? { caption } : {}) });
       const form = new FormData();
-      form.set("source", new Blob([buffer], { type: dataMatch[1] }), `affiliate-image.${extension}`);
+      form.set("source", new Blob([imageData.buffer], { type: imageData.mimeType }), `affiliate-image.${imageData.extension}`);
       form.set("published", String(Boolean(published)));
       if (caption) form.set("caption", caption);
       form.set("access_token", page.accessToken);
@@ -610,7 +637,7 @@ app.post("/api/publish", async (req, res) => {
         if (videoState.status === "timeout") throw new Error(`Facebook vẫn đang xử lý video (${videoState.detail}). Hãy thử đăng lại sau ít phút.`);
         attachedMedia.push({ media_fbid: video.id });
       } finally {
-        await fs.rm(prepared.outputPath, { force: true }).catch(() => {});
+        await fs.rm(prepared.outputPath, { force: true }).catch(() => { });
       }
       result = await graphPost("feed", { message: draft.caption, attached_media: attachedMedia });
     } else if (videoUrls.length === 1) {
@@ -632,7 +659,7 @@ app.post("/api/publish", async (req, res) => {
         if (!upload.ok) throw new Error(body.error?.message || "Meta tu choi upload video");
         result = body;
       } finally {
-        await fs.rm(prepared.outputPath, { force: true }).catch(() => {});
+        await fs.rm(prepared.outputPath, { force: true }).catch(() => { });
       }
     } else if (imageUrls.length === 1) {
       result = await uploadFacebookPhoto(imageUrls[0], true, draft.caption);
@@ -653,15 +680,45 @@ app.post("/api/publish", async (req, res) => {
     let commentResult = null;
     let pinResult = null;
     const commentMessage = [draft.commentText, draft.affiliateLink].map(value => String(value || "").trim()).filter(Boolean).join("\n\n");
-    if (commentMessage && postId) {
+    const commentImage = String(draft.commentImage || "").trim();
+    if ((commentMessage || commentImage) && postId) {
       if (!facebook.grantedPermissions?.includes("pages_manage_engagement")) {
         commentResult = { error: { message: "Token chưa có pages_manage_engagement. Vào Tài khoản > Cấp quyền comment rồi đăng nhập lại." } };
       } else {
-        const commentResponse = await fetch(`https://graph.facebook.com/${metaVersion}/${postId}/comments`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: commentMessage, access_token: page.accessToken }) });
-        commentResult = await commentResponse.json();
-        if (commentResponse.ok && commentResult.id) {
-          const pinResponse = await fetch(`https://graph.facebook.com/${metaVersion}/${commentResult.id}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ is_pinned: true, access_token: page.accessToken }) });
-          pinResult = await pinResponse.json();
+        try {
+          let attachmentId = "";
+          if (commentImage) {
+            const uploadedCommentImage = await uploadFacebookPhoto(commentImage, false);
+            attachmentId = uploadedCommentImage.id || "";
+            if (!attachmentId) throw new Error("Meta không trả ID cho ảnh trong comment.");
+          }
+          const commentEndpoint = `https://graph.facebook.com/${metaVersion}/${postId}/comments`;
+          const commentPayload = { ...(commentMessage ? { message: commentMessage } : {}), ...(attachmentId ? { attachment_id: attachmentId } : {}), access_token: page.accessToken };
+          let commentResponse = await fetch(commentEndpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(commentPayload) });
+          commentResult = await commentResponse.json().catch(() => ({}));
+
+          // A few Page/API combinations reject attachment_id but accept a
+          // direct image upload on the comments edge, so keep this fallback.
+          if ((!commentResponse.ok || !commentResult.id) && commentImage) {
+            const imageData = decodeImageDataUrl(commentImage);
+            if (imageData) {
+              const form = new FormData();
+              if (commentMessage) form.set("message", commentMessage);
+              form.set("source", new Blob([imageData.buffer], { type: imageData.mimeType }), `affiliate-comment.${imageData.extension}`);
+              form.set("access_token", page.accessToken);
+              commentResponse = await fetch(commentEndpoint, { method: "POST", body: form, signal: AbortSignal.timeout(120000) });
+              commentResult = await commentResponse.json().catch(() => ({}));
+            }
+          }
+
+          if (commentResponse.ok && commentResult.id) {
+            const pinResponse = await fetch(`https://graph.facebook.com/${metaVersion}/${commentResult.id}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ is_pinned: true, access_token: page.accessToken }) });
+            pinResult = await pinResponse.json();
+          } else if (!commentResult.error) {
+            commentResult = { error: { message: "Meta từ chối ảnh trong comment." } };
+          }
+        } catch (error) {
+          commentResult = { error: { message: error.message } };
         }
       }
     }

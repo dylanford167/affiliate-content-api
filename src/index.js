@@ -863,13 +863,16 @@ app.post("/api/publish", async (req, res) => {
         try {
           let attachmentId = "";
           let hostedCommentImage = null;
+          const imageErrors = [];
           if (commentImage) {
-            try { hostedCommentImage = await hostPublicCommentImage(commentImage, "facebook-comments"); } catch {}
+            try { hostedCommentImage = await hostPublicCommentImage(commentImage, "facebook-comments"); }
+            catch (error) { imageErrors.push(`Lưu ảnh comment: ${error.message}`); }
           }
           const commentEndpoint = `https://graph.facebook.com/${metaVersion}/${postId}/comments`;
           const commentPayload = { ...(commentMessage ? { message: commentMessage } : {}), ...(hostedCommentImage?.url ? { attachment_url: hostedCommentImage.url } : {}), access_token: page.accessToken };
           let commentResponse = await fetch(commentEndpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(commentPayload) });
           commentResult = await commentResponse.json().catch(() => ({}));
+          if ((!commentResponse.ok || !commentResult.id) && commentResult.error?.message) imageErrors.push(`URL ảnh: ${commentResult.error.message}`);
 
           // Some Page/API combinations reject attachment_url. Retry with an
           // unpublished Page photo attachment before falling back to multipart.
@@ -877,10 +880,11 @@ app.post("/api/publish", async (req, res) => {
             try {
               const uploadedCommentImage = await uploadFacebookPhoto(commentImage, false);
               attachmentId = uploadedCommentImage.id || "";
-            } catch {}
+            } catch (error) { imageErrors.push(`Tải ảnh lên Page: ${error.message}`); }
             if (attachmentId) {
               commentResponse = await fetch(commentEndpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...(commentMessage ? { message: commentMessage } : {}), attachment_id: attachmentId, access_token: page.accessToken }) });
               commentResult = await commentResponse.json().catch(() => ({}));
+              if ((!commentResponse.ok || !commentResult.id) && commentResult.error?.message) imageErrors.push(`Đính kèm ảnh: ${commentResult.error.message}`);
             }
           }
           // Keep a final multipart fallback for Graph versions that accept a
@@ -894,21 +898,41 @@ app.post("/api/publish", async (req, res) => {
               form.set("access_token", page.accessToken);
               commentResponse = await fetch(commentEndpoint, { method: "POST", body: form, signal: AbortSignal.timeout(120000) });
               commentResult = await commentResponse.json().catch(() => ({}));
+              if ((!commentResponse.ok || !commentResult.id) && commentResult.error?.message) imageErrors.push(`Multipart ảnh: ${commentResult.error.message}`);
             }
           }
 
           if (commentResponse.ok && commentResult.id) {
+            if (imageErrors.length && commentImage) commentResult.image_error = imageErrors.join(" | ");
             const pinResponse = await fetch(`https://graph.facebook.com/${metaVersion}/${commentResult.id}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ is_pinned: true, access_token: page.accessToken }) });
             pinResult = await pinResponse.json();
           } else if (!commentResult.error) {
             commentResult = { error: { message: "Meta từ chối ảnh trong comment." } };
+          }
+          // A Page may have permission to comment but not permission to attach
+          // media to comments. Preserve the useful text/link comment instead
+          // of reporting the whole operation as failed.
+          if ((!commentResult?.id) && commentMessage && commentImage) {
+            const textOnlyResponse = await fetch(commentEndpoint, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ message: commentMessage, access_token: page.accessToken })
+            });
+            const textOnly = await textOnlyResponse.json().catch(() => ({}));
+            if (textOnlyResponse.ok && textOnly.id) {
+              commentResult = { ...textOnly, image_error: imageErrors.join(" | ") || commentResult.error?.message || "Meta không cho phép đính kèm ảnh comment." };
+              const pinResponse = await fetch(`https://graph.facebook.com/${metaVersion}/${textOnly.id}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ is_pinned: true, access_token: page.accessToken }) });
+              pinResult = await pinResponse.json();
+            } else if (textOnly.error?.message) {
+              commentResult = { error: { message: `${commentResult.error?.message || "Không đăng được comment ảnh"} | Comment chữ cũng thất bại: ${textOnly.error.message}` } };
+            }
           }
         } catch (error) {
           commentResult = { error: { message: error.message } };
         }
       }
     }
-    return res.json({ requestId: crypto.randomUUID(), results: [{ platform: "facebook", pageId: page.id, ok: true, postId, comment: commentResult ? { ok: Boolean(commentResult.id), id: commentResult.id, error: commentResult.error?.message } : null, pin: pinResult ? { ok: Boolean(pinResult.success || !pinResult.error), error: pinResult.error?.message } : null }] });
+    return res.json({ requestId: crypto.randomUUID(), results: [{ platform: "facebook", pageId: page.id, ok: true, postId, comment: commentResult ? { ok: Boolean(commentResult.id), id: commentResult.id, error: commentResult.error?.message, imageError: commentResult.image_error } : null, pin: pinResult ? { ok: Boolean(pinResult.success || !pinResult.error), error: pinResult.error?.message } : null }] });
     if (!response.ok) throw new Error(result.error?.message || "Meta từ chối đăng bài");
     res.json({ requestId: crypto.randomUUID(), results: [{ platform: "facebook", pageId: page.id, ok: true, postId: result.post_id || result.id }] });
   } catch (error) {

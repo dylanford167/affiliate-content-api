@@ -96,6 +96,11 @@ body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d1
 </head><body><main class="card"><span class="status"><i class="dot"></i>Server đang hoạt động</span><h1>Affiliate Content Studio</h1><p>Server API đã sẵn sàng tại cổng <code>${port}</code>.</p><ol><li>Giữ cửa sổ terminal đang chạy.</li><li>Mở một bài mạng xã hội được hỗ trợ.</li><li>Mở Chrome Extension và bấm <b>Quét bài viết hiện tại</b>.</li></ol><p>Kiểm tra kỹ thuật: <a href="/health">/health</a></p></main></body></html>`);
 });
 app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/api/config/status", (_req, res) => res.json({
+  serverUrl: publicBaseUrl,
+  facebook: { configured: Boolean(process.env.META_APP_ID && process.env.META_APP_SECRET), appId: process.env.META_APP_ID || "", callback: `${publicBaseUrl}/auth/meta/callback` },
+  threads: { configured: Boolean(process.env.THREADS_APP_ID && process.env.THREADS_APP_SECRET), appId: process.env.THREADS_APP_ID || "", callback: `${publicBaseUrl}/auth/threads/callback` }
+}));
 app.get("/api/accounts", async (_req, res) => {
   const facebook = accounts.get("facebook");
   if (facebook?.userAccessToken) {

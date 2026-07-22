@@ -513,6 +513,8 @@ app.post("/api/publish", async (req, res) => {
       const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
       const isTransientThreadsError = error =>
         error?.httpStatus === 429 || error?.httpStatus >= 500 || [1, 2, 4, 17, 32, 341].includes(Number(error?.apiCode));
+      const isPendingContainerLookup = error =>
+        error?.httpStatus === 404 || Number(error?.apiCode) === 24 || /requested resource does not exist|media with id .*cannot be found|4279009/i.test(error?.message || "");
       const waitContainer = async (id, { timeoutMs = 120000, label = "media" } = {}) => {
         const startedAt = Date.now();
         let attempt = 0;
@@ -528,7 +530,7 @@ app.post("/api/publish", async (req, res) => {
               throw new Error(state.error_message || `Threads xử lý ${label} thất bại (${lastStatus})`);
             }
           } catch (error) {
-            if (!isTransientThreadsError(error)) throw error;
+            if (!isTransientThreadsError(error) && !isPendingContainerLookup(error)) throw error;
             lastLookupError = error;
           }
           const delayMs = Math.min(5000, 1200 + attempt * 350);
@@ -595,12 +597,33 @@ app.post("/api/publish", async (req, res) => {
           }));
           created.forEach((id, batchIndex) => { children[offset + batchIndex] = id; });
         }
+        // Creating a child returns an ID before Threads has finished fetching
+        // and processing the public image/video URL. Referencing that ID in a
+        // carousel too early produces #24/4279009 (media cannot be found).
+        await Promise.all(children.map((id, index) => waitContainer(id, {
+          timeoutMs: 120000,
+          label: `carousel child ${index + 1}`
+        })));
+        // Allow the ready state to propagate to the carousel endpoint.
+        await sleep(900);
         return children;
       };
       let creation;
       if (selectedUrls.length > 1) {
         const children = await createCarouselChildren();
-        creation = await threadsPost("me/threads", { media_type: "CAROUSEL", children: children.join(","), text: draft.caption }, "Tạo carousel");
+        let createError;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            creation = await threadsPost("me/threads", { media_type: "CAROUSEL", children: children.join(","), text: draft.caption }, "Tạo carousel");
+            break;
+          } catch (error) {
+            createError = error;
+            const childNotVisibleYet = /requested resource does not exist|media with id .*cannot be found|4279009/i.test(error.message);
+            if (!childNotVisibleYet || attempt === 2) throw error;
+            await sleep(1500 * (attempt + 1));
+          }
+        }
+        if (!creation?.id) throw createError || new Error("Threads không tạo được carousel");
       } else {
         const mediaType = selectedVideos.length ? "VIDEO" : selectedUrls.length ? "IMAGE" : "TEXT";
         const publicUrl = selectedUrls[0] ? mediaProxyUrl(selectedUrls[0]) : "";

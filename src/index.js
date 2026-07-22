@@ -10,7 +10,7 @@ import { openAsBlob } from "node:fs";
 import { spawn } from "node:child_process";
 import { Readable } from "node:stream";
 import ffmpegPath from "ffmpeg-static";
-import { put as putBlob, del as deleteBlob } from "@vercel/blob";
+import { put as putBlob } from "@vercel/blob";
 
 const serverDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 dotenv.config({ path: path.join(serverDirectory, ".env") });
@@ -18,6 +18,8 @@ dotenv.config({ path: path.join(serverDirectory, ".env") });
 const app = express();
 const port = Number(process.env.PORT || 8787);
 const accounts = new Map(); // MVP only: replace with encrypted DB storage.
+const threadsAccounts = new Map();
+let activeThreadsAccountId = null;
 const oauthStates = new Map();
 const preparedMedia = new Map();
 const publicBaseUrl = process.env.PUBLIC_BASE_URL || `http://localhost:${port}`;
@@ -26,8 +28,50 @@ const threadsScopes = [...new Set([
   ...(process.env.THREADS_SCOPES || "").split(",").map(value => value.trim()).filter(Boolean),
   "threads_basic",
   "threads_content_publish",
+  "threads_read_replies",
   "threads_manage_replies"
 ])].join(",");
+const threadsOAuthStateSecret = process.env.OAUTH_STATE_SECRET || process.env.THREADS_APP_SECRET || process.env.META_APP_SECRET || "development-only";
+function createThreadsOAuthState() {
+  const payload = Buffer.from(JSON.stringify({ platform: "threads", nonce: crypto.randomUUID(), createdAt: Date.now() })).toString("base64url");
+  const signature = crypto.createHmac("sha256", threadsOAuthStateSecret).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+function verifyThreadsOAuthState(value) {
+  try {
+    const [payload, signature] = String(value || "").split(".");
+    if (!payload || !signature) return false;
+    const expected = crypto.createHmac("sha256", threadsOAuthStateSecret).update(payload).digest("base64url");
+    const validSignature = signature.length === expected.length && crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+    if (!validSignature) return false;
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    return data.platform === "threads" && Number.isFinite(data.createdAt) && Date.now() - data.createdAt < 10 * 60 * 1000;
+  } catch {
+    return false;
+  }
+}
+const threadsBundleKey = crypto.createHash("sha256").update(process.env.ACCOUNT_BUNDLE_SECRET || process.env.SESSION_SECRET || threadsOAuthStateSecret).digest();
+function sealThreadsAccount(account) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", threadsBundleKey, iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify({
+    profile: account.profile,
+    grantedPermissions: account.grantedPermissions,
+    userAccessToken: account.userAccessToken,
+    expiresAt: account.expiresAt || null,
+    issuedAt: Date.now()
+  }), "utf8"), cipher.final()]);
+  return ["v1", iv.toString("base64url"), cipher.getAuthTag().toString("base64url"), encrypted.toString("base64url")].join(".");
+}
+function openThreadsAccountBundle(value) {
+  const [version, ivValue, tagValue, encryptedValue] = String(value || "").split(".");
+  if (version !== "v1" || !ivValue || !tagValue || !encryptedValue) throw new Error("Thông tin kết nối Threads không hợp lệ");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", threadsBundleKey, Buffer.from(ivValue, "base64url"));
+  decipher.setAuthTag(Buffer.from(tagValue, "base64url"));
+  const payload = JSON.parse(Buffer.concat([decipher.update(Buffer.from(encryptedValue, "base64url")), decipher.final()]).toString("utf8"));
+  if (!payload.profile?.id || !payload.userAccessToken) throw new Error("Thông tin kết nối Threads bị thiếu");
+  return { connectedAt: new Date(payload.issuedAt || Date.now()).toISOString(), profile: payload.profile, items: [{ id: payload.profile.id, name: payload.profile.username }], grantedPermissions: payload.grantedPermissions || [], userAccessToken: payload.userAccessToken, expiresAt: payload.expiresAt || null };
+}
 app.use(cors({ origin: /^chrome-extension:\/\// }));
 app.use(express.json({ limit: "4mb" }));
 
@@ -64,7 +108,7 @@ app.get("/api/accounts", async (_req, res) => {
       facebook.pagesRefreshError = error.message;
     }
   }
-  res.json(Object.fromEntries([...accounts].map(([key, value]) => [key, {
+  const response = Object.fromEntries([...accounts].map(([key, value]) => [key, {
     connected: true,
     profile: value.profile,
     grantedPermissions: value.grantedPermissions || [],
@@ -72,7 +116,45 @@ app.get("/api/accounts", async (_req, res) => {
     canComment: (value.grantedPermissions || []).includes("pages_manage_engagement"),
     items: (value.items || []).map(item => ({ id: item.id, name: item.name, username: item.username, pageId: item.pageId, pageName: item.pageName })),
     refreshError: value.pagesRefreshError || undefined
-  }])));
+  }]));
+  // Keep the old `threads` shape for backwards compatibility, while exposing
+  // every connected Threads identity without ever returning access tokens.
+  if (threadsAccounts.size) {
+    response.threads = {
+      ...(response.threads || {}),
+      connected: true,
+      activeAccountId: activeThreadsAccountId,
+      accounts: [...threadsAccounts.values()].map(account => ({
+        id: account.profile.id,
+        username: account.profile.username,
+        name: account.profile.name || account.profile.username,
+        profilePictureUrl: account.profile.threads_profile_picture_url || "",
+        connectedAt: account.connectedAt,
+        grantedPermissions: account.grantedPermissions || []
+      }))
+    };
+  }
+  res.json(response);
+});
+
+app.post("/api/accounts/threads/select", (req, res) => {
+  const accountId = String(req.body?.accountId || "").trim();
+  const account = threadsAccounts.get(accountId);
+  if (!account) return res.status(404).json({ error: "Không tìm thấy tài khoản Threads" });
+  activeThreadsAccountId = accountId;
+  accounts.set("threads", account);
+  res.json({ ok: true, activeAccountId: accountId });
+});
+
+app.delete("/api/accounts/threads/:accountId", (req, res) => {
+  const accountId = String(req.params.accountId || "").trim();
+  if (!threadsAccounts.delete(accountId)) return res.status(404).json({ error: "Không tìm thấy tài khoản Threads" });
+  if (activeThreadsAccountId === accountId) {
+    activeThreadsAccountId = threadsAccounts.keys().next().value || null;
+    const next = activeThreadsAccountId ? threadsAccounts.get(activeThreadsAccountId) : null;
+    if (next) accounts.set("threads", next); else accounts.delete("threads");
+  }
+  res.json({ ok: true, activeAccountId: activeThreadsAccountId });
 });
 
 const allowedMediaHosts = ["facebook.com", "fbcdn.net", "cdninstagram.com", "instagram.com", "threads.net", "threads.com", "tiktok.com", "tiktokcdn.com", "tiktokcdn-us.com", "byteoversea.com", "ibytedtos.com", "muscdn.com", "akamaized.net"];
@@ -83,6 +165,24 @@ function assertAllowedMediaUrl(value) {
 }
 
 const mediaProxySecret = process.env.MEDIA_PROXY_SECRET || process.env.THREADS_APP_SECRET || process.env.META_APP_SECRET || "development-only";
+function decodeCommentImageDataUrl(value) {
+  const source = String(value || "");
+  const match = source.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) return null;
+  const buffer = Buffer.from(match[2], "base64");
+  if (!buffer.length) throw new Error("Ảnh comment rỗng.");
+  return { buffer, mimeType: match[1], extension: match[1].split("/")[1].replace("jpg", "jpeg") };
+}
+async function hostPublicCommentImage(value, prefix = "comments") {
+  const source = String(value || "").trim();
+  if (/^https:\/\//i.test(source)) return { url: source, cleanup: null };
+  const imageData = decodeCommentImageDataUrl(source);
+  if (!imageData) throw new Error("Ảnh comment không đúng định dạng.");
+  if (imageData.buffer.length > 3 * 1024 * 1024) throw new Error("Ảnh comment vượt giới hạn 3 MB.");
+  if (!process.env.BLOB_READ_WRITE_TOKEN) throw new Error("Thiếu BLOB_READ_WRITE_TOKEN để gửi ảnh comment.");
+  const blob = await putBlob(`${prefix}/${crypto.randomUUID()}.${imageData.extension}`, imageData.buffer, { access: "public", contentType: imageData.mimeType, addRandomSuffix: false });
+  return { url: blob.url, cleanup: null };
+}
 function signMediaValue(value) {
   return crypto.createHmac("sha256", mediaProxySecret).update(value).digest("base64url");
 }
@@ -246,8 +346,7 @@ app.get("/auth/:platform", (req, res) => {
   if (platform === "threads") {
     const clientId = process.env.THREADS_APP_ID;
     if (!clientId || !process.env.THREADS_APP_SECRET) return res.status(501).send("Thiếu THREADS_APP_ID hoặc THREADS_APP_SECRET trong server/.env");
-    const state = crypto.randomUUID();
-    oauthStates.set(state, { platform, createdAt: Date.now() });
+    const state = createThreadsOAuthState();
     const params = new URLSearchParams({ client_id: clientId, redirect_uri: `${publicBaseUrl}/auth/threads/callback`, scope: threadsScopes, response_type: "code", state });
     return res.redirect(`https://threads.net/oauth/authorize?${params}`);
   }
@@ -262,18 +361,41 @@ app.get("/auth/:platform", (req, res) => {
 });
 
 app.get("/auth/threads/callback", async (req, res) => {
-  const state = String(req.query.state || ""); const session = oauthStates.get(state); oauthStates.delete(state);
-  if (!session || session.platform !== "threads") return res.status(400).send("Threads OAuth state không hợp lệ.");
+  const state = String(req.query.state || "");
+  if (!verifyThreadsOAuthState(state)) return res.status(400).send("Threads OAuth state không hợp lệ hoặc đã hết hạn.");
   if (req.query.error || !req.query.code) return res.status(400).send(`Threads từ chối: ${req.query.error_message || req.query.error || "missing code"}`);
   try {
     const form = new URLSearchParams({ client_id: process.env.THREADS_APP_ID, client_secret: process.env.THREADS_APP_SECRET, grant_type: "authorization_code", redirect_uri: `${publicBaseUrl}/auth/threads/callback`, code: String(req.query.code) });
     const tokenResponse = await fetch("https://graph.threads.net/oauth/access_token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: form });
     const token = await tokenResponse.json(); if (!tokenResponse.ok || !token.access_token) throw new Error(token.error_message || token.error?.message || "Không lấy được token");
-    const profileResponse = await fetch(`https://graph.threads.net/v1.0/me?fields=id,username,threads_profile_picture_url&access_token=${encodeURIComponent(token.access_token)}`);
+    let userAccessToken = token.access_token;
+    let expiresIn = Number(token.expires_in || 0);
+    try {
+      const longTokenParams = new URLSearchParams({ grant_type: "th_exchange_token", client_secret: process.env.THREADS_APP_SECRET, access_token: token.access_token });
+      const longTokenResponse = await fetch(`https://graph.threads.net/access_token?${longTokenParams}`);
+      const longToken = await longTokenResponse.json().catch(() => ({}));
+      if (longTokenResponse.ok && longToken.access_token) {
+        userAccessToken = longToken.access_token;
+        expiresIn = Number(longToken.expires_in || expiresIn);
+      }
+    } catch {}
+    const profileResponse = await fetch(`https://graph.threads.net/v1.0/me?fields=id,username,name,threads_profile_picture_url&access_token=${encodeURIComponent(userAccessToken)}`);
     const profile = await profileResponse.json(); if (!profileResponse.ok) throw new Error(profile.error?.message || "Không đọc được Threads profile");
-    accounts.set("threads", { connectedAt: new Date().toISOString(), profile, items: [{ id: profile.id, name: profile.username }], grantedPermissions: threadsScopes.split(","), userAccessToken: token.access_token });
-    res.type("html").send(`<meta charset="utf-8"><h1>Đã kết nối Threads</h1><p>@${profile.username}</p><p>Đóng tab này và bấm Làm mới trong extension.</p>`);
+    const account = { connectedAt: new Date().toISOString(), profile, items: [{ id: profile.id, name: profile.username }], grantedPermissions: threadsScopes.split(","), userAccessToken, expiresAt: expiresIn ? Date.now() + expiresIn * 1000 : null };
+    threadsAccounts.set(profile.id, account);
+    activeThreadsAccountId = profile.id;
+    // Keep the legacy active-account slot so existing publishing code and
+    // already-saved drafts continue to work unchanged.
+    accounts.set("threads", account);
+    const connectedParams = new URLSearchParams({ accountId: profile.id, username: profile.username || "", name: profile.name || profile.username || "", profilePictureUrl: profile.threads_profile_picture_url || "", bundle: sealThreadsAccount(account) });
+    // Keep the encrypted bundle in the URL fragment so it is not sent to the
+    // server again or recorded in request logs. The extension captures it.
+    res.redirect(`${publicBaseUrl}/auth/threads/connected#${connectedParams}`);
   } catch (error) { res.status(500).send(`Threads OAuth thất bại: ${error.message}`); }
+});
+
+app.get("/auth/threads/connected", (_req, res) => {
+  res.type("html").send(`<meta charset="utf-8"><title>Đã kết nối Threads</title><style>body{background:#090c11;color:#fff;font:16px system-ui;padding:40px}strong{color:#6bb8ff}</style><h1>Đã kết nối Threads</h1><p>Rymz Space đang tự động nhận ID và lưu tài khoản. Bạn có thể đóng tab này.</p><script>setTimeout(()=>window.close(),1800)</script>`);
 });
 
 app.get("/auth/tiktok/callback", async (req, res) => {
@@ -348,8 +470,17 @@ app.post("/api/publish", async (req, res) => {
   const selectedVideos = selectedUrls.filter(url => (draft.videos || []).includes(url));
 
   if (publishPlatform === "threads") {
-    const threads = accounts.get("threads");
+    const requestedThreadsAccountId = String(draft.threadsAccountId || "").trim();
+    let bundledThreadsAccount = null;
+    if (draft.threadsAuthBundle) {
+      try { bundledThreadsAccount = openThreadsAccountBundle(draft.threadsAuthBundle); }
+      catch (error) { return res.status(401).json({ error: `${error.message}. Hãy kết nối lại tài khoản Threads.` }); }
+    }
+    const threads = bundledThreadsAccount || (requestedThreadsAccountId
+      ? threadsAccounts.get(requestedThreadsAccountId)
+      : (threadsAccounts.get(activeThreadsAccountId) || accounts.get("threads")));
     if (!threads) return res.status(401).json({ error: "Threads chưa kết nối" });
+    if (requestedThreadsAccountId && threads.profile?.id !== requestedThreadsAccountId) return res.status(400).json({ error: "Tài khoản Threads đã chọn không khớp thông tin kết nối" });
     if (selectedUrls.length > 20) return res.status(400).json({ error: "Threads hỗ trợ tối đa 20 media mỗi carousel" });
     try {
       const threadsPost = async (path, payload, stage = path) => {
@@ -423,17 +554,27 @@ app.post("/api/publish", async (req, res) => {
         }
         throw lastError;
       };
+      const waitPublishedThread = async (id, { timeoutMs = 30000, label = "bài viết" } = {}) => {
+        const startedAt = Date.now();
+        let lastError;
+        while (Date.now() - startedAt < timeoutMs) {
+          try {
+            const thread = await threadsGet(id, { fields: "id,media_type,text,permalink" });
+            if (thread?.id) return thread;
+          } catch (error) {
+            lastError = error;
+          }
+          await sleep(1500);
+        }
+        const error = new Error(`Threads đã trả ID nhưng chưa xác nhận ${label} hiển thị.${lastError?.message ? ` ${lastError.message}` : ""}`);
+        error.apiCode = lastError?.apiCode;
+        error.httpStatus = lastError?.httpStatus;
+        throw error;
+      };
       const hostThreadsCommentImage = async value => {
-        const source = String(value || "").trim();
-        if (/^https:\/\//i.test(source)) return { url: source, cleanup: null };
-        const match = source.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
-        if (!match) throw new Error("Ảnh comment Threads không đúng định dạng.");
-        if (!process.env.BLOB_READ_WRITE_TOKEN) throw new Error("Thiếu BLOB_READ_WRITE_TOKEN để gửi ảnh comment Threads. Hãy tạo Vercel Blob Store public và thêm biến môi trường.");
-        const buffer = Buffer.from(match[2], "base64");
-        if (!buffer.length || buffer.length > 3 * 1024 * 1024) throw new Error("Ảnh comment Threads vượt giới hạn 3 MB.");
-        const extension = match[1].split("/")[1].replace("jpg", "jpeg");
-        const blob = await putBlob(`threads-comments/${crypto.randomUUID()}.${extension}`, buffer, { access: "public", contentType: match[1], addRandomSuffix: false });
-        return { url: blob.url, cleanup: () => deleteBlob(blob.url) };
+        // Threads fetches image_url asynchronously, so keep the public Blob
+        // available while the reply container is processed and published.
+        return hostPublicCommentImage(value, "threads-comments");
       };
       const createCarouselChildren = async () => {
         const children = new Array(selectedUrls.length);
@@ -472,26 +613,40 @@ app.post("/api/publish", async (req, res) => {
       const commentImage = String(draft.commentImage || "").trim();
       let comment = null;
       if ((commentMessage || commentImage) && published.id) {
+        // Give the newly published root post a moment to propagate before a
+        // reply references it. A failed verification must never fail the post.
+        await sleep(1800);
         let replyError;
         let hostedImage;
+        let replyCreationId;
+        let replyPublishedId;
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
             if (commentImage && !hostedImage) hostedImage = await hostThreadsCommentImage(commentImage);
-            const replyContainer = await threadsPost("me/threads", commentImage
-              ? { media_type: "IMAGE", ...(commentMessage ? { text: commentMessage } : {}), image_url: hostedImage.url, reply_to_id: published.id }
-              : { media_type: "TEXT", text: commentMessage, reply_to_id: published.id, auto_publish_text: true }, "Đăng comment Threads");
-            if (!replyContainer.id) throw new Error("Threads không trả ID comment container");
-            const reply = commentImage ? await publishContainer(replyContainer.id, "comment Threads") : replyContainer;
-            if (!reply.id) throw new Error("Threads không trả ID comment");
-            comment = { ok: true, id: reply.id, pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } };
+            if (!replyCreationId) {
+              const replyContainer = await threadsPost("me/threads", commentImage
+                ? { media_type: "IMAGE", ...(commentMessage ? { text: commentMessage } : {}), image_url: hostedImage.url, reply_to_id: published.id }
+                : { media_type: "TEXT", text: commentMessage, reply_to_id: published.id }, "Tạo comment Threads");
+              if (!replyContainer.id) throw new Error("Threads không trả ID comment container");
+              replyCreationId = replyContainer.id;
+            }
+            // A reply is a normal Threads media container and must go through
+            // threads_publish. A container ID alone is not proof it is visible.
+            if (!replyPublishedId) {
+              const reply = await publishContainer(replyCreationId, "comment Threads");
+              if (!reply.id) throw new Error("Threads không trả ID comment");
+              replyPublishedId = reply.id;
+            }
+            const confirmedReply = await waitPublishedThread(replyPublishedId, { timeoutMs: 30000, label: "comment" });
+            comment = { ok: true, id: replyPublishedId, permalink: confirmedReply.permalink, imageUrl: hostedImage?.url, pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } };
             break;
           } catch (error) {
             replyError = error;
-            if (!isTransientThreadsError(error) || attempt === 2) break;
+            // Reuse a created container so a retry cannot create duplicate replies.
+            if ((!replyCreationId && !isTransientThreadsError(error)) || attempt === 2) break;
             await sleep(1500 * (attempt + 1));
           }
         }
-        if (hostedImage?.cleanup) await hostedImage.cleanup().catch(() => { });
         if (!comment) comment = { ok: false, error: replyError?.message || "Threads không đăng được comment", pin: { ok: false, error: "Threads API hiện chưa cung cấp endpoint ghim reply." } };
       }
       return res.json({ requestId: crypto.randomUUID(), results: [{ platform: "threads", ok: true, postId: published.id, comment }] });
@@ -550,12 +705,9 @@ app.post("/api/publish", async (req, res) => {
     };
 
     const decodeImageDataUrl = value => {
-      const source = String(value || "");
-      const match = source.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
-      if (!match) return null;
-      const buffer = Buffer.from(match[2], "base64");
-      if (!buffer.length || buffer.length > 3 * 1024 * 1024) throw new Error("Ảnh thêm từ máy vượt giới hạn 3 MB.");
-      return { buffer, mimeType: match[1], extension: match[1].split("/")[1].replace("jpg", "jpeg") };
+      const imageData = decodeCommentImageDataUrl(value);
+      if (imageData && imageData.buffer.length > 3 * 1024 * 1024) throw new Error("Ảnh thêm từ máy vượt giới hạn 3 MB.");
+      return imageData;
     };
 
     const uploadFacebookPhoto = async (value, published, caption = "") => {
@@ -687,18 +839,29 @@ app.post("/api/publish", async (req, res) => {
       } else {
         try {
           let attachmentId = "";
+          let hostedCommentImage = null;
           if (commentImage) {
-            const uploadedCommentImage = await uploadFacebookPhoto(commentImage, false);
-            attachmentId = uploadedCommentImage.id || "";
-            if (!attachmentId) throw new Error("Meta không trả ID cho ảnh trong comment.");
+            try { hostedCommentImage = await hostPublicCommentImage(commentImage, "facebook-comments"); } catch {}
           }
           const commentEndpoint = `https://graph.facebook.com/${metaVersion}/${postId}/comments`;
-          const commentPayload = { ...(commentMessage ? { message: commentMessage } : {}), ...(attachmentId ? { attachment_id: attachmentId } : {}), access_token: page.accessToken };
+          const commentPayload = { ...(commentMessage ? { message: commentMessage } : {}), ...(hostedCommentImage?.url ? { attachment_url: hostedCommentImage.url } : {}), access_token: page.accessToken };
           let commentResponse = await fetch(commentEndpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(commentPayload) });
           commentResult = await commentResponse.json().catch(() => ({}));
 
-          // A few Page/API combinations reject attachment_id but accept a
-          // direct image upload on the comments edge, so keep this fallback.
+          // Some Page/API combinations reject attachment_url. Retry with an
+          // unpublished Page photo attachment before falling back to multipart.
+          if ((!commentResponse.ok || !commentResult.id) && commentImage) {
+            try {
+              const uploadedCommentImage = await uploadFacebookPhoto(commentImage, false);
+              attachmentId = uploadedCommentImage.id || "";
+            } catch {}
+            if (attachmentId) {
+              commentResponse = await fetch(commentEndpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...(commentMessage ? { message: commentMessage } : {}), attachment_id: attachmentId, access_token: page.accessToken }) });
+              commentResult = await commentResponse.json().catch(() => ({}));
+            }
+          }
+          // Keep a final multipart fallback for Graph versions that accept a
+          // raw source on the comments edge but reject both URL and attachment.
           if ((!commentResponse.ok || !commentResult.id) && commentImage) {
             const imageData = decodeImageDataUrl(commentImage);
             if (imageData) {

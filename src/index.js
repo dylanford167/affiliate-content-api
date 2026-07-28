@@ -77,7 +77,7 @@ app.use(express.json({ limit: "4mb" }));
 
 async function fetchManagedFacebookPages(userAccessToken) {
   const params = new URLSearchParams({
-    fields: "id,name,access_token,instagram_business_account{id,username}",
+    fields: "id,name,access_token,tasks,instagram_business_account{id,username}",
     limit: "100",
     access_token: userAccessToken
   });
@@ -106,7 +106,7 @@ app.get("/api/accounts", async (_req, res) => {
   if (facebook?.userAccessToken) {
     try {
       const pageData = await fetchManagedFacebookPages(facebook.userAccessToken);
-      facebook.items = pageData.map(page => ({ id: page.id, name: page.name, accessToken: page.access_token }));
+      facebook.items = pageData.map(page => ({ id: page.id, name: page.name, accessToken: page.access_token, tasks: page.tasks || [] }));
       facebook.pagesRefreshedAt = new Date().toISOString();
       facebook.pagesRefreshError = null;
     } catch (error) {
@@ -119,7 +119,7 @@ app.get("/api/accounts", async (_req, res) => {
     grantedPermissions: value.grantedPermissions || [],
     canPublish: (value.grantedPermissions || []).includes("pages_manage_posts"),
     canComment: (value.grantedPermissions || []).includes("pages_manage_engagement"),
-    items: (value.items || []).map(item => ({ id: item.id, name: item.name, username: item.username, pageId: item.pageId, pageName: item.pageName })),
+    items: (value.items || []).map(item => ({ id: item.id, name: item.name, username: item.username, pageId: item.pageId, pageName: item.pageName, tasks: item.tasks || [] })),
     refreshError: value.pagesRefreshError || undefined
   }]));
   // Keep the old `threads` shape for backwards compatibility, while exposing
@@ -187,6 +187,59 @@ async function hostPublicCommentImage(value, prefix = "comments") {
   if (!process.env.BLOB_READ_WRITE_TOKEN) throw new Error("Thiếu BLOB_READ_WRITE_TOKEN để gửi ảnh comment.");
   const blob = await putBlob(`${prefix}/${crypto.randomUUID()}.${imageData.extension}`, imageData.buffer, { access: "public", contentType: imageData.mimeType, addRandomSuffix: false });
   return { url: blob.url, cleanup: null };
+}
+
+function imageExtension(mimeType, sourceUrl = "") {
+  const normalized = String(mimeType || "").toLowerCase().split(";", 1)[0];
+  const known = { "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "image/avif": "avif" };
+  if (known[normalized]) return known[normalized];
+  const match = String(sourceUrl).match(/\.([a-z0-9]{2,5})(?:[?#]|$)/i);
+  return match ? match[1].toLowerCase() : "jpg";
+}
+
+// Threads tải URL media ở một lượt riêng. Với URL CDN có tham số biến đổi ảnh,
+// dùng proxy khiến Threads đôi khi lấy lại biến thể thumbnail. Lưu nguyên byte
+// ảnh đã quét vào Blob giúp Threads luôn nhận đúng file gốc đã được chọn.
+async function fetchOriginalImage(sourceUrl) {
+  let currentSource = assertAllowedMediaUrl(sourceUrl);
+  let upstream;
+  for (let redirect = 0; redirect < 4; redirect++) {
+    const hostname = new URL(currentSource).hostname;
+    const referer = hostname.endsWith("fbcdn.net") || hostname.endsWith("facebook.com") ? "https://www.facebook.com/"
+      : hostname.endsWith("cdninstagram.com") || hostname.endsWith("instagram.com") ? "https://www.instagram.com/"
+        : "https://www.threads.net/";
+    upstream = await fetch(currentSource, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+        Referer: referer
+      },
+      redirect: "manual",
+      signal: AbortSignal.timeout(120000)
+    });
+    if (![301, 302, 303, 307, 308].includes(upstream.status)) break;
+    const location = upstream.headers.get("location");
+    if (!location) break;
+    currentSource = assertAllowedMediaUrl(new URL(location, currentSource).href);
+  }
+  if (!upstream?.ok) throw new Error(`Không tải được ảnh gốc (${upstream?.status || "network"})`);
+  const contentType = String(upstream.headers.get("content-type") || "").split(";", 1)[0].toLowerCase();
+  if (!contentType.startsWith("image/")) throw new Error("Nguồn đã chọn không trả về file ảnh");
+  const buffer = Buffer.from(await upstream.arrayBuffer());
+  if (!buffer.length) throw new Error("Ảnh gốc rỗng");
+  if (buffer.length > 24 * 1024 * 1024) throw new Error("Ảnh gốc vượt giới hạn 24 MB của luồng xuất bản");
+  return { buffer, contentType, sourceUrl: currentSource };
+}
+
+async function hostThreadsPublishImage(sourceUrl) {
+  // Blob is optional for local development; the signed proxy remains a safe fallback.
+  if (!process.env.BLOB_READ_WRITE_TOKEN) return mediaProxyUrl(sourceUrl);
+  const image = await fetchOriginalImage(sourceUrl);
+  const blob = await putBlob(`threads-media/${crypto.randomUUID()}.${imageExtension(image.contentType, image.sourceUrl)}`, image.buffer, {
+    access: "public",
+    contentType: image.contentType,
+    addRandomSuffix: false
+  });
+  return blob.url;
 }
 function signMediaValue(value) {
   return crypto.createHmac("sha256", mediaProxySecret).update(value).digest("base64url");
@@ -270,7 +323,10 @@ async function prepareVideoMp4(sourceUrl) {
     try {
       await runFfmpeg([...common, "-c", "copy", outputPath]);
     } catch {
-      await runFfmpeg([...common, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", outputPath]);
+      // Copy is lossless and remains the first choice. If the source container
+      // must be rebuilt, use a visually-lossless encode instead of the old
+      // CRF 22 fallback which made social video visibly softer after upload.
+      await runFfmpeg([...common, "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k", outputPath]);
     }
     const stat = await fs.stat(outputPath);
     if (stat.size < 1024) throw new Error("Video MP4 tao ra khong hop le");
@@ -297,7 +353,7 @@ app.post("/api/media/prepare", async (req, res) => {
     try {
       await runFfmpeg([...common, "-c", "copy", outputPath]);
     } catch {
-      await runFfmpeg([...common, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", outputPath]);
+      await runFfmpeg([...common, "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k", outputPath]);
     }
     const stat = await fs.stat(outputPath);
     if (stat.size < 1024) throw new Error("Video MP4 tạo ra không hợp lệ");
@@ -322,7 +378,9 @@ app.get("/auth/facebook/engagement", (_req, res) => {
   if (!process.env.META_APP_ID || !process.env.META_APP_SECRET) return res.status(501).send("Thiếu META_APP_ID hoặc META_APP_SECRET");
   const state = crypto.randomUUID();
   oauthStates.set(state, { platform: "facebook", purpose: "engagement", createdAt: Date.now() });
-  const params = new URLSearchParams({ client_id: process.env.META_APP_ID, redirect_uri: `${publicBaseUrl}/auth/meta/callback`, state, response_type: "code", scope: "pages_manage_engagement", auth_type: "rerequest" });
+  const configuredScopes = (process.env.META_FACEBOOK_SCOPES || "").split(",").map(value => value.trim()).filter(Boolean);
+  const scopes = [...new Set([...configuredScopes, "pages_show_list", "pages_read_engagement", "pages_manage_posts", "pages_manage_engagement"])];
+  const params = new URLSearchParams({ client_id: process.env.META_APP_ID, redirect_uri: `${publicBaseUrl}/auth/meta/callback`, state, response_type: "code", scope: scopes.join(","), auth_type: "rerequest" });
   res.redirect(`https://www.facebook.com/${metaVersion}/dialog/oauth?${params}`);
 });
 
@@ -449,14 +507,17 @@ app.get("/auth/meta/callback", async (req, res) => {
     catch (error) { pagesError = error.message; }
     const connected = session.platform === "instagram"
       ? pageData.filter(page => page.instagram_business_account).map(page => ({ pageId: page.id, pageName: page.name, ...page.instagram_business_account, accessToken: page.access_token }))
-      : pageData.map(page => ({ id: page.id, name: page.name, accessToken: page.access_token }));
+      : pageData.map(page => ({ id: page.id, name: page.name, accessToken: page.access_token, tasks: page.tasks || [] }));
     const previousAccount = accounts.get(session.platform);
-    const mergedPermissions = [...new Set([...(previousAccount?.grantedPermissions || []), ...grantedPermissions])];
+    // Never merge a freshly issued token with stale permission flags. Doing so
+    // makes the UI claim that commenting is allowed while the current token no
+    // longer contains pages_manage_engagement.
+    const effectivePermissions = permissionsResponse.ok ? grantedPermissions : (previousAccount?.grantedPermissions || []);
     accounts.set(session.platform, {
       connectedAt: new Date().toISOString(),
       profile: { id: profile.id, name: profile.name },
       items: connected.length ? connected : (previousAccount?.items || []),
-      grantedPermissions: mergedPermissions,
+      grantedPermissions: effectivePermissions,
       userAccessToken: token.access_token
     });
     const permissionNote = !pagesError ? "" : `<p style="color:#ffcb6b">Đăng nhập cơ bản thành công, nhưng app chưa đọc lại được Page: ${pagesError}. Hãy kiểm tra quyền Page trong Meta Use Case rồi kết nối lại.</p>`;
@@ -488,6 +549,17 @@ app.post("/api/publish", async (req, res) => {
     if (requestedThreadsAccountId && threads.profile?.id !== requestedThreadsAccountId) return res.status(400).json({ error: "Tài khoản Threads đã chọn không khớp thông tin kết nối" });
     if (selectedUrls.length > 20) return res.status(400).json({ error: "Threads hỗ trợ tối đa 20 media mỗi carousel" });
     try {
+      const threadsImageUrls = new Map();
+      const threadsPublicMediaUrl = async (url, isVideo) => {
+        if (isVideo) return mediaProxyUrl(url);
+        if (!threadsImageUrls.has(url)) {
+          threadsImageUrls.set(url, hostThreadsPublishImage(url).catch(error => {
+            console.warn("Không thể lưu ảnh Threads gốc vào Blob, dùng proxy:", error.message);
+            return mediaProxyUrl(url);
+          }));
+        }
+        return threadsImageUrls.get(url);
+      };
       const threadsPost = async (path, payload, stage = path) => {
         const form = new URLSearchParams(Object.entries({ ...payload, access_token: threads.userAccessToken }).map(([key, value]) => [key, String(value)]));
         const response = await fetch(`https://graph.threads.net/v1.0/${path}`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: form });
@@ -591,7 +663,7 @@ app.post("/api/publish", async (req, res) => {
           const created = await Promise.all(batch.map(async (url, batchIndex) => {
             const index = offset + batchIndex;
             const isVideo = selectedVideos.includes(url);
-            const publicUrl = mediaProxyUrl(url);
+            const publicUrl = await threadsPublicMediaUrl(url, isVideo);
             const child = await threadsPost("me/threads", {
               media_type: isVideo ? "VIDEO" : "IMAGE",
               ...(isVideo ? { video_url: publicUrl } : { image_url: publicUrl }),
@@ -631,7 +703,7 @@ app.post("/api/publish", async (req, res) => {
         if (!creation?.id) throw createError || new Error("Threads không tạo được carousel");
       } else {
         const mediaType = selectedVideos.length ? "VIDEO" : selectedUrls.length ? "IMAGE" : "TEXT";
-        const publicUrl = selectedUrls[0] ? mediaProxyUrl(selectedUrls[0]) : "";
+        const publicUrl = selectedUrls[0] ? await threadsPublicMediaUrl(selectedUrls[0], mediaType === "VIDEO") : "";
         creation = await threadsPost("me/threads", { media_type: mediaType, text: draft.caption, ...(mediaType === "IMAGE" ? { image_url: publicUrl } : {}), ...(mediaType === "VIDEO" ? { video_url: publicUrl } : {}) }, `Tạo bài ${mediaType.toLowerCase()}`);
       }
       if (!creation.id) throw new Error("Threads không tạo được media container");
@@ -874,8 +946,13 @@ app.post("/api/publish", async (req, res) => {
             catch (error) { imageErrors.push(`Lưu ảnh comment: ${error.message}`); }
           }
           const commentEndpoint = `https://graph.facebook.com/${metaVersion}/${postId}/comments`;
+          const postFacebookComment = payload => fetch(commentEndpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams(Object.entries({ ...payload, access_token: page.accessToken }).filter(([, value]) => value !== undefined && value !== "").map(([key, value]) => [key, String(value)]))
+          });
           const commentPayload = { ...(commentMessage ? { message: commentMessage } : {}), ...(hostedCommentImage?.url ? { attachment_url: hostedCommentImage.url } : {}), access_token: page.accessToken };
-          let commentResponse = await fetch(commentEndpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(commentPayload) });
+          let commentResponse = await postFacebookComment(commentPayload);
           commentResult = await commentResponse.json().catch(() => ({}));
           if ((!commentResponse.ok || !commentResult.id) && commentResult.error?.message) imageErrors.push(`URL ảnh: ${commentResult.error.message}`);
 
@@ -887,7 +964,7 @@ app.post("/api/publish", async (req, res) => {
               attachmentId = uploadedCommentImage.id || "";
             } catch (error) { imageErrors.push(`Tải ảnh lên Page: ${error.message}`); }
             if (attachmentId) {
-              commentResponse = await fetch(commentEndpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...(commentMessage ? { message: commentMessage } : {}), attachment_id: attachmentId, access_token: page.accessToken }) });
+              commentResponse = await postFacebookComment({ ...(commentMessage ? { message: commentMessage } : {}), attachment_id: attachmentId });
               commentResult = await commentResponse.json().catch(() => ({}));
               if ((!commentResponse.ok || !commentResult.id) && commentResult.error?.message) imageErrors.push(`Đính kèm ảnh: ${commentResult.error.message}`);
             }
@@ -918,11 +995,7 @@ app.post("/api/publish", async (req, res) => {
           // media to comments. Preserve the useful text/link comment instead
           // of reporting the whole operation as failed.
           if ((!commentResult?.id) && commentMessage && commentImage) {
-            const textOnlyResponse = await fetch(commentEndpoint, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: commentMessage, access_token: page.accessToken })
-            });
+            const textOnlyResponse = await postFacebookComment({ message: commentMessage });
             const textOnly = await textOnlyResponse.json().catch(() => ({}));
             if (textOnlyResponse.ok && textOnly.id) {
               commentResult = { ...textOnly, image_error: imageErrors.join(" | ") || commentResult.error?.message || "Meta không cho phép đính kèm ảnh comment." };
@@ -931,6 +1004,11 @@ app.post("/api/publish", async (req, res) => {
             } else if (textOnly.error?.message) {
               commentResult = { error: { message: `${commentResult.error?.message || "Không đăng được comment ảnh"} | Comment chữ cũng thất bại: ${textOnly.error.message}` } };
             }
+          }
+          if (commentResult?.error?.message) {
+            const tasks = Array.isArray(page.tasks) && page.tasks.length ? page.tasks.join(", ") : "Meta không trả task của Page";
+            const code = [commentResult.error.code, commentResult.error.error_subcode].filter(value => value !== undefined).join("/");
+            commentResult.error.message = `${commentResult.error.message}${code ? ` (#${code})` : ""}. Page tasks: ${tasks}. Hãy kết nối lại Facebook và cấp quyền quản lý bình luận cho đúng Page.`;
           }
         } catch (error) {
           commentResult = { error: { message: error.message } };

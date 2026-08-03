@@ -4,7 +4,10 @@
   "type": "module",
   "scripts": {
     "dev": "node src/index.js",
-    "start": "node src/index.js"
+    "site": "node src/start-site.js",
+    "start": "node src/index.js",
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/site.js && node --check src/downloader.js && node --check src/index.js"
   },
   "dependencies": {
     "@vercel/blob": "^2.6.1",

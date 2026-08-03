@@ -11,6 +11,8 @@ import { spawn } from "node:child_process";
 import { Readable } from "node:stream";
 import ffmpegPath from "ffmpeg-static";
 import { put as putBlob } from "@vercel/blob";
+import { createDownloaderRouter } from "./downloader.js";
+import { COVER_SVG, DOWNLOADER_PATHS, FAVICON_SVG, SITE_CSS, SITE_JS, renderAdsTxt, renderDownloaderPage, renderManifest, renderRobots, renderSitemap } from "./site.js";
 
 const serverDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 dotenv.config({ path: path.join(serverDirectory, ".env") });
@@ -74,6 +76,12 @@ function openThreadsAccountBundle(value) {
 }
 app.use(cors({ origin: /^chrome-extension:\/\// }));
 app.use(express.json({ limit: "4mb" }));
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
 
 async function fetchManagedFacebookPages(userAccessToken) {
   const params = new URLSearchParams({
@@ -87,6 +95,20 @@ async function fetchManagedFacebookPages(userAccessToken) {
   return Array.isArray(body.data) ? body.data : [];
 }
 
+// The public downloader is isolated from the existing OAuth/publishing API.
+// Registering these routes before the legacy health screen lets `/` become the
+// SEO landing page without changing any extension endpoints below.
+app.use("/api/downloader", createDownloaderRouter({ secret: process.env.DOWNLOADER_SIGNING_SECRET || process.env.MEDIA_PROXY_SECRET || process.env.META_APP_SECRET }));
+app.get("/assets/downloader.css", (_req, res) => res.type("text/css").set("Cache-Control", "public, max-age=3600").send(SITE_CSS));
+app.get("/assets/downloader.js", (_req, res) => res.type("application/javascript").set("Cache-Control", "public, max-age=3600").send(SITE_JS));
+app.get("/assets/favicon.svg", (_req, res) => res.type("image/svg+xml").set("Cache-Control", "public, max-age=86400").send(FAVICON_SVG));
+app.get("/assets/rymz-cover.svg", (_req, res) => res.type("image/svg+xml").set("Cache-Control", "public, max-age=86400").send(COVER_SVG));
+app.get("/robots.txt", (_req, res) => res.type("text/plain").send(renderRobots()));
+app.get("/sitemap.xml", (_req, res) => res.type("application/xml").send(renderSitemap()));
+app.get("/ads.txt", (_req, res) => res.type("text/plain").send(renderAdsTxt()));
+app.get("/site.webmanifest", (_req, res) => res.type("application/manifest+json").send(renderManifest()));
+app.get(DOWNLOADER_PATHS, (req, res) => res.type("html").set("Cache-Control", "public, max-age=300").send(renderDownloaderPage(req.path)));
+
 app.get("/", (_req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -95,7 +117,7 @@ app.get("/", (_req, res) => {
 body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d10;color:#f6f7f8;font:16px/1.55 system-ui,sans-serif}.card{width:min(560px,calc(100% - 40px));padding:32px;border:1px solid #293039;border-radius:20px;background:#15191e;box-shadow:0 24px 80px #0008}.status{display:inline-flex;align-items:center;gap:8px;padding:6px 11px;border-radius:999px;background:#202a1d;color:#cbff4a;font-size:13px;font-weight:700}.dot{width:8px;height:8px;border-radius:50%;background:#cbff4a;box-shadow:0 0 12px #cbff4a}h1{font-size:28px;line-height:1.15;margin:18px 0 10px}p{color:#aeb7c1}ol{padding-left:20px;color:#d8dde2}code{padding:3px 6px;border-radius:5px;background:#0b0d10;color:#c9b9ff}a{color:#cbff4a}</style>
 </head><body><main class="card"><span class="status"><i class="dot"></i>Server đang hoạt động</span><h1>Affiliate Content Studio</h1><p>Server API đã sẵn sàng tại cổng <code>${port}</code>.</p><ol><li>Giữ cửa sổ terminal đang chạy.</li><li>Mở một bài mạng xã hội được hỗ trợ.</li><li>Mở Chrome Extension và bấm <b>Quét bài viết hiện tại</b>.</li></ol><p>Kiểm tra kỹ thuật: <a href="/health">/health</a></p></main></body></html>`);
 });
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => res.json({ ok: true, mediaPipeline: 2, release: "0.2.6" }));
 app.get("/api/config/status", (_req, res) => res.json({
   serverUrl: publicBaseUrl,
   facebook: { configured: Boolean(process.env.META_APP_ID && process.env.META_APP_SECRET), appId: process.env.META_APP_ID || "", callback: `${publicBaseUrl}/auth/meta/callback` },
@@ -117,7 +139,9 @@ app.get("/api/accounts", async (_req, res) => {
     connected: true,
     profile: value.profile,
     grantedPermissions: value.grantedPermissions || [],
-    canPublish: (value.grantedPermissions || []).includes("pages_manage_posts"),
+    canPublish: key === "instagram"
+      ? (value.grantedPermissions || []).includes("instagram_content_publish")
+      : (value.grantedPermissions || []).includes("pages_manage_posts"),
     canComment: (value.grantedPermissions || []).includes("pages_manage_engagement"),
     items: (value.items || []).map(item => ({ id: item.id, name: item.name, username: item.username, pageId: item.pageId, pageName: item.pageName, tasks: item.tasks || [] })),
     refreshError: value.pagesRefreshError || undefined
@@ -162,11 +186,42 @@ app.delete("/api/accounts/threads/:accountId", (req, res) => {
   res.json({ ok: true, activeAccountId: activeThreadsAccountId });
 });
 
-const allowedMediaHosts = ["facebook.com", "fbcdn.net", "cdninstagram.com", "instagram.com", "threads.net", "threads.com", "tiktok.com", "tiktokcdn.com", "tiktokcdn-us.com", "byteoversea.com", "ibytedtos.com", "muscdn.com", "akamaized.net"];
+// Product scanners use the same publish pipeline as social scanners. Keep
+// remote fetching allow-listed, but include the first-party commerce CDNs.
+const allowedMediaHosts = [
+  "facebook.com", "fb.watch", "fbcdn.net", "fbsbx.com", "cdninstagram.com", "instagram.com", "threads.net", "threads.com",
+  "pinterest.com", "pin.it", "pinimg.com", "pinterestusercontent.com",
+  "tiktok.com", "tiktokv.com", "tiktokcdn.com", "tiktokcdn-us.com", "byteoversea.com", "ibytedtos.com", "muscdn.com", "akamaized.net",
+  "shopee.vn", "shopee.com", "shopeesz.com", "shopeemobile.com", "susercontent.com", "shopeeusercontent.com",
+  "lazada.vn", "lazada.com", "slatic.net", "lazcdn.com", "lazvideo.com", "alicdn.com", "alicdn.net", "aliyuncs.com"
+];
+const commerceMediaHosts = [
+  "shopee.vn", "shopee.com", "shopeesz.com", "shopeemobile.com", "susercontent.com", "shopeeusercontent.com",
+  "lazada.vn", "lazada.com", "slatic.net", "lazcdn.com", "lazvideo.com", "alicdn.com", "alicdn.net", "aliyuncs.com"
+];
+function hostMatches(hostname, hosts) {
+  return hosts.some(host => hostname === host || hostname.endsWith(`.${host}`));
+}
 function assertAllowedMediaUrl(value) {
   const url = new URL(value);
-  if (url.protocol !== "https:" || !allowedMediaHosts.some(host => url.hostname === host || url.hostname.endsWith(`.${host}`))) throw new Error("URL video không thuộc CDN mạng xã hội được hỗ trợ");
+  if (url.protocol !== "https:" || !hostMatches(url.hostname, allowedMediaHosts)) throw new Error("URL media khong thuoc CDN nguon duoc ho tro");
   return url.href;
+}
+
+function isCommerceMediaUrl(value) {
+  try { return hostMatches(new URL(value).hostname, commerceMediaHosts); }
+  catch { return false; }
+}
+
+function mediaReferer(value) {
+  const hostname = new URL(value).hostname;
+  if (hostMatches(hostname, ["fbcdn.net", "facebook.com", "fbsbx.com"])) return "https://www.facebook.com/";
+  if (hostMatches(hostname, ["cdninstagram.com", "instagram.com"])) return "https://www.instagram.com/";
+  if (hostMatches(hostname, ["threads.net", "threads.com"])) return "https://www.threads.net/";
+  if (hostMatches(hostname, ["shopee.vn", "shopee.com", "shopeesz.com", "shopeemobile.com", "susercontent.com", "shopeeusercontent.com"])) return "https://shopee.vn/";
+  if (hostMatches(hostname, ["lazada.vn", "lazada.com", "slatic.net", "lazcdn.com", "lazvideo.com", "alicdn.com", "alicdn.net", "aliyuncs.com"])) return "https://www.lazada.vn/";
+  if (hostMatches(hostname, ["pinterest.com", "pinimg.com", "pinterestusercontent.com", "pin.it"])) return "https://www.pinterest.com/";
+  return "https://www.tiktok.com/";
 }
 
 const mediaProxySecret = process.env.MEDIA_PROXY_SECRET || process.env.THREADS_APP_SECRET || process.env.META_APP_SECRET || "development-only";
@@ -204,10 +259,7 @@ async function fetchOriginalImage(sourceUrl) {
   let currentSource = assertAllowedMediaUrl(sourceUrl);
   let upstream;
   for (let redirect = 0; redirect < 4; redirect++) {
-    const hostname = new URL(currentSource).hostname;
-    const referer = hostname.endsWith("fbcdn.net") || hostname.endsWith("facebook.com") ? "https://www.facebook.com/"
-      : hostname.endsWith("cdninstagram.com") || hostname.endsWith("instagram.com") ? "https://www.instagram.com/"
-        : "https://www.threads.net/";
+    const referer = mediaReferer(currentSource);
     upstream = await fetch(currentSource, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
@@ -241,6 +293,22 @@ async function hostThreadsPublishImage(sourceUrl) {
   });
   return blob.url;
 }
+
+async function hostPublicPublishVideo(sourceUrl, prefix = "publish-media") {
+  if (!process.env.BLOB_READ_WRITE_TOKEN) return mediaProxyUrl(sourceUrl);
+  const prepared = await prepareVideoMp4(sourceUrl);
+  try {
+    const videoFile = await openAsBlob(prepared.outputPath, { type: "video/mp4" });
+    const blob = await putBlob(`${prefix}/${crypto.randomUUID()}.mp4`, videoFile, {
+      access: "public",
+      contentType: "video/mp4",
+      addRandomSuffix: false
+    });
+    return blob.url;
+  } finally {
+    await fs.rm(prepared.outputPath, { force: true }).catch(() => {});
+  }
+}
 function signMediaValue(value) {
   return crypto.createHmac("sha256", mediaProxySecret).update(value).digest("base64url");
 }
@@ -258,11 +326,7 @@ app.get("/api/media/proxy", async (req, res) => {
     const expected = signMediaValue(encoded);
     if (!signature || signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return res.status(403).end();
     const source = assertAllowedMediaUrl(Buffer.from(encoded, "base64url").toString("utf8"));
-    const hostname = new URL(source).hostname;
-    const referer = hostname.endsWith("fbcdn.net") || hostname.endsWith("facebook.com") ? "https://www.facebook.com/"
-      : hostname.endsWith("cdninstagram.com") || hostname.endsWith("instagram.com") ? "https://www.instagram.com/"
-        : hostname.endsWith("threads.net") || hostname.endsWith("threads.com") ? "https://www.threads.net/"
-          : "https://www.tiktok.com/";
+    const referer = mediaReferer(source);
     const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36", Referer: referer };
     if (req.headers.range) headers.Range = req.headers.range;
     let currentSource = source;
@@ -313,11 +377,7 @@ function runFfmpeg(args, timeoutMs = 180000) {
 async function prepareVideoMp4(sourceUrl) {
   const source = fullVideoUrl(sourceUrl);
   const outputPath = path.join(os.tmpdir(), `affiliate-${crypto.randomUUID()}.mp4`);
-  const hostname = new URL(source).hostname;
-  const referer = hostname.endsWith("fbcdn.net") || hostname.endsWith("facebook.com") ? "https://www.facebook.com/"
-    : hostname.endsWith("cdninstagram.com") || hostname.endsWith("instagram.com") ? "https://www.instagram.com/"
-      : hostname.endsWith("threads.net") || hostname.endsWith("threads.com") ? "https://www.threads.net/"
-        : "https://www.tiktok.com/";
+  const referer = mediaReferer(source);
   const common = ["-y", "-loglevel", "error", "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36", "-referer", referer, "-i", source, "-map", "0:v:0", "-map", "0:a?", "-movflags", "+faststart"];
   try {
     try {
@@ -344,11 +404,7 @@ app.post("/api/media/prepare", async (req, res) => {
     const sourceUrl = fullVideoUrl(req.body?.url);
     const id = crypto.randomUUID();
     outputPath = path.join(os.tmpdir(), `affiliate-${id}.mp4`);
-    const hostname = new URL(sourceUrl).hostname;
-    const referer = hostname.endsWith("fbcdn.net") || hostname.endsWith("facebook.com") ? "https://www.facebook.com/"
-      : hostname.endsWith("cdninstagram.com") || hostname.endsWith("instagram.com") ? "https://www.instagram.com/"
-        : hostname.endsWith("threads.net") || hostname.endsWith("threads.com") ? "https://www.threads.net/"
-          : "https://www.tiktok.com/";
+    const referer = mediaReferer(sourceUrl);
     const common = ["-y", "-loglevel", "error", "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36", "-referer", referer, "-i", sourceUrl, "-map", "0:v:0", "-map", "0:a?", "-movflags", "+faststart"];
     try {
       await runFfmpeg([...common, "-c", "copy", outputPath]);
@@ -533,7 +589,110 @@ app.post("/api/publish", async (req, res) => {
   if (!draft.sourceUrl) return res.status(400).json({ error: "Thiếu URL nguồn" });
   const publishPlatform = draft.publishPlatform || "facebook";
   const selectedUrls = (Array.isArray(draft.media) ? draft.media : []).map(item => typeof item === "string" ? item : item?.url).filter(Boolean);
-  const selectedVideos = selectedUrls.filter(url => (draft.videos || []).includes(url));
+  const manifestVideoUrls = new Set((Array.isArray(draft.mediaManifest) ? draft.mediaManifest : [])
+    .filter(item => item?.type === "video" && item?.url)
+    .map(item => item.url));
+  const knownVideoUrls = new Set([...(draft.videos || []), ...manifestVideoUrls]);
+  const selectedVideos = selectedUrls.filter(url => knownVideoUrls.has(url) || looksLikeVideoUrl(url));
+
+  if (publishPlatform === "instagram") {
+    const instagram = accounts.get("instagram");
+    if (!instagram) return res.status(401).json({ error: "Instagram chưa kết nối" });
+    if (!instagram.grantedPermissions?.includes("instagram_content_publish")) {
+      return res.status(403).json({ error: "Token Instagram chưa có instagram_content_publish. Hãy cấu hình quyền rồi kết nối lại." });
+    }
+    const account = instagram.items?.find(item => item.id === String(draft.instagramAccountId || ""));
+    if (!account) return res.status(400).json({ error: "Hãy chọn tài khoản Instagram để đăng" });
+    if (!selectedUrls.length) return res.status(400).json({ error: "Instagram yêu cầu ít nhất một ảnh hoặc video" });
+    if (selectedUrls.length > 10) return res.status(400).json({ error: "Instagram hỗ trợ tối đa 10 media mỗi carousel" });
+    try {
+      const videoSet = new Set(selectedVideos);
+      const hosted = new Map();
+      const publicMediaUrl = async (url, isVideo) => {
+        const key = `${isVideo ? "video" : "image"}:${url}`;
+        if (!hosted.has(key)) hosted.set(key, isVideo
+          ? hostPublicPublishVideo(url, "instagram-media")
+          : hostThreadsPublishImage(url));
+        return hosted.get(key);
+      };
+      const graphPost = async (path, payload, stage) => {
+        const body = new URLSearchParams(Object.entries({ ...payload, access_token: account.accessToken }).map(([key, value]) => [key, String(value)]));
+        const response = await fetch(`https://graph.facebook.com/${metaVersion}/${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(`${stage}: ${data.error?.message || "Instagram API từ chối yêu cầu"}`);
+        return data;
+      };
+      const graphGet = async (path, payload = {}) => {
+        const params = new URLSearchParams(Object.entries({ ...payload, access_token: account.accessToken }).map(([key, value]) => [key, String(value)]));
+        const response = await fetch(`https://graph.facebook.com/${metaVersion}/${path}?${params}`);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error?.message || "Không kiểm tra được trạng thái Instagram media");
+        return data;
+      };
+      const waitContainer = async (id, label) => {
+        const startedAt = Date.now();
+        let status = "IN_PROGRESS";
+        while (Date.now() - startedAt < 120000) {
+          const state = await graphGet(id, { fields: "status_code,status" });
+          status = String(state.status_code || state.status || "IN_PROGRESS").toUpperCase();
+          if (["FINISHED", "PUBLISHED"].includes(status)) return state;
+          if (["ERROR", "EXPIRED"].includes(status)) throw new Error(`Instagram xử lý ${label} thất bại (${status})`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+        throw new Error(`Instagram xử lý ${label} quá 120 giây`);
+      };
+
+      let creationId;
+      if (selectedUrls.length === 1) {
+        const url = selectedUrls[0];
+        const isVideo = videoSet.has(url) || looksLikeVideoUrl(url);
+        const publicUrl = await publicMediaUrl(url, isVideo);
+        const creation = await graphPost(`${account.id}/media`, {
+          ...(isVideo ? { media_type: "REELS", video_url: publicUrl } : { image_url: publicUrl }),
+          caption: draft.caption
+        }, "Tạo Instagram media");
+        creationId = creation.id;
+        await waitContainer(creationId, "media");
+      } else {
+        const childIds = [];
+        for (const url of selectedUrls) {
+          const isVideo = videoSet.has(url) || looksLikeVideoUrl(url);
+          const publicUrl = await publicMediaUrl(url, isVideo);
+          const child = await graphPost(`${account.id}/media`, {
+            is_carousel_item: true,
+            ...(isVideo ? { media_type: "VIDEO", video_url: publicUrl } : { image_url: publicUrl })
+          }, "Tạo media carousel Instagram");
+          await waitContainer(child.id, "media carousel");
+          childIds.push(child.id);
+        }
+        const carousel = await graphPost(`${account.id}/media`, {
+          media_type: "CAROUSEL",
+          children: childIds.join(","),
+          caption: draft.caption
+        }, "Tạo carousel Instagram");
+        creationId = carousel.id;
+        await waitContainer(creationId, "carousel");
+      }
+      const published = await graphPost(`${account.id}/media_publish`, { creation_id: creationId }, "Xuất bản Instagram");
+      const commentMessage = [draft.commentText, draft.affiliateLink].map(value => String(value || "").trim()).filter(Boolean).join("\n\n");
+      let comment = null;
+      if (commentMessage) {
+        try {
+          const result = await graphPost(`${published.id}/comments`, { message: commentMessage }, "Comment Instagram");
+          comment = { ok: true, id: result.id, pin: { ok: false, error: "Instagram API chưa hỗ trợ ghim comment trong luồng này." } };
+        } catch (error) {
+          comment = { ok: false, error: error.message };
+        }
+      }
+      return res.json({ requestId: crypto.randomUUID(), results: [{ platform: "instagram", ok: true, postId: published.id, comment }] });
+    } catch (error) {
+      return res.status(502).json({ error: error.message });
+    }
+  }
 
   if (publishPlatform === "threads") {
     const requestedThreadsAccountId = String(draft.threadsAccountId || "").trim();
@@ -551,7 +710,12 @@ app.post("/api/publish", async (req, res) => {
     try {
       const threadsImageUrls = new Map();
       const threadsPublicMediaUrl = async (url, isVideo) => {
-        if (isVideo) return mediaProxyUrl(url);
+        // Signed commerce video URLs often expire or reject Meta's crawler.
+        // Store a normalized MP4 in the configured public Blob store. Preserve
+        // the existing social-CDN proxy path to avoid changing the old flow.
+        if (isVideo) return isCommerceMediaUrl(url)
+          ? hostPublicPublishVideo(url, "threads-media")
+          : mediaProxyUrl(url);
         if (!threadsImageUrls.has(url)) {
           threadsImageUrls.set(url, hostThreadsPublishImage(url).catch(error => {
             console.warn("Không thể lưu ảnh Threads gốc vào Blob, dùng proxy:", error.message);
@@ -787,7 +951,7 @@ app.post("/api/publish", async (req, res) => {
   if (!page) return res.status(400).json({ error: "Hãy chọn Facebook Page để đăng" });
   try {
     const selected = (Array.isArray(draft.media) ? draft.media : []).map(item => typeof item === "string" ? item : item?.url).filter(Boolean);
-    const videoSet = new Set(draft.videos || []);
+    const videoSet = new Set(selectedVideos);
     const videoUrls = selected.filter(url => videoSet.has(url) || looksLikeVideoUrl(url));
     const imageUrls = selected.filter(url => !videoSet.has(url) && !looksLikeVideoUrl(url));
     if (videoUrls.length > 1) throw new Error("Hiện chỉ hỗ trợ một video mỗi bài.");
@@ -813,9 +977,10 @@ app.post("/api/publish", async (req, res) => {
     const uploadFacebookPhoto = async (value, published, caption = "") => {
       const source = String(value || "");
       const imageData = decodeImageDataUrl(source);
-      if (!imageData) return graphPost("photos", { url: source, published, ...(caption ? { caption } : {}) });
+      if (!imageData && !isCommerceMediaUrl(source)) return graphPost("photos", { url: source, published, ...(caption ? { caption } : {}) });
+      const uploadImage = imageData || await fetchOriginalImage(source);
       const form = new FormData();
-      form.set("source", new Blob([imageData.buffer], { type: imageData.mimeType }), `affiliate-image.${imageData.extension}`);
+      form.set("source", new Blob([uploadImage.buffer], { type: uploadImage.mimeType || uploadImage.contentType }), `affiliate-image.${imageData?.extension || imageExtension(uploadImage.contentType, uploadImage.sourceUrl)}`);
       form.set("published", String(Boolean(published)));
       if (caption) form.set("caption", caption);
       form.set("access_token", page.accessToken);
